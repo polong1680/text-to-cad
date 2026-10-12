@@ -44,8 +44,6 @@ if __name__ == "__main__":
     hinge()
 """
 
-ANIM_JS = "export const clips = { demo: { duration: 2, update(t, m) {} } };\n"
-
 # The same hinge, but each side is a GROUP of two parts. Mating the groups is
 # what "a mate on a parent occurrence carries its whole instance subtree" means
 # in practice, and it is the shape every real assembly has.
@@ -118,12 +116,10 @@ class KinematicsBuildTests(unittest.TestCase):
         self._tempdir.cleanup()
 
     def _build(self, script: Path) -> int:
-        from cadgen.catalog import StepImportOptions
         from cadgen.generation import generate_step_targets
 
         return generate_step_targets(
             [str(script)],
-            step_options=StepImportOptions(),
             force=True,
             verbose=False,
         )
@@ -148,11 +144,13 @@ class KinematicsBuildTests(unittest.TestCase):
         return script
 
     def test_kinematics_lands_in_the_sidecar(self) -> None:
+        from cadgen._internal.source_sidecar import SOURCE_SIDECAR_SCHEMA_VERSION
+
         script = self._write("hinge.py")
         self.assertEqual(0, self._build(script))
 
         sidecar = self._sidecar(script)
-        self.assertEqual(sidecar["schemaVersion"], 9)
+        self.assertEqual(sidecar["schemaVersion"], SOURCE_SIDECAR_SCHEMA_VERSION)
         # The sidecar file carries the branded suffix.
         self.assertTrue((self.root / "hinge.step.json").is_file())
 
@@ -166,8 +164,7 @@ class KinematicsBuildTests(unittest.TestCase):
         self.assertEqual(mate["axis"], {"origin": [0.0, 0.0, 6.0], "dir": [0.0, 0.0, 1.0]})
         self.assertEqual(block["poses"], {"open": {"swing": 45.0}})
 
-        # Choreography is not a sidecar section: the render module beside the
-        # document (hinge.step.js) is the viewer's, never the build's.
+        # A model that declares no clips carries no animation section.
         self.assertNotIn("animation", sidecar)
 
         # The descriptor stays STEP-pure: kinematics is sidecar-only.
@@ -247,15 +244,16 @@ class KinematicsBuildTests(unittest.TestCase):
 
     def test_mates_resolve_without_reading_any_component(self) -> None:
         # A mate's ends name occurrences, never topology: a group, a leaf, a
-        # label or an id. Resolving them reads no component's SURF and writes no
-        # view of the tree; each of those cost seconds on a large assembly and
-        # derived SURF inside the build when the store had none.
+        # label or an id. Resolving them reads no component's selector table and
+        # writes no view of the tree; each of those cost seconds on a large assembly
+        # and derived display data inside the build when the store had none.
         script = self.root / "grouped.py"
         script.write_text(GROUPED_MODEL, encoding="utf-8")
         refused = AssertionError("mate ends need no component topology")
         with mock.patch("cadgen.store.view.export_view", side_effect=refused), \
-                mock.patch("cadgen.store.view.materialize_view_surfaces", side_effect=refused), \
-                mock.patch("cadgen.assembly_lookup._read_component_bundle", side_effect=refused):
+                mock.patch("cadgen.store.view.materialize_parts", side_effect=refused), \
+                mock.patch("cadgen.store.parts.derive", side_effect=refused), \
+                mock.patch("cadgen.assembly_lookup._read_component_table", side_effect=refused):
             self.assertEqual(0, self._build(script))
         (mate,) = self._sidecar(script)["kinematics"]["mates"]
         self.assertEqual((mate["parentId"], mate["childId"]), ("o1.1", "o1.2"))
@@ -265,7 +263,7 @@ class KinematicsBuildTests(unittest.TestCase):
         from cadgen.assembly_lookup import index_with_assembly_occurrences
         from cadgen.lookup import build_selector_index
         from cadgen.selector_types import SelectorBundle
-        from cadgen.step_topology_artifact import StepTopologyArtifact
+        from cadgen.step_targets import StepArtifact
         from cadgen.store import view
         from cadgen.store.index import model_ref
         from cadgen.store.records import read_record
@@ -294,7 +292,7 @@ class KinematicsBuildTests(unittest.TestCase):
         package = original(tree)
         try:
             manifest = json.loads((package / "assembly.json").read_text(encoding="utf-8"))
-            artifact = StepTopologyArtifact(
+            artifact = StepArtifact(
                 cad_path="pivot", source_path=script, step_path=script.with_suffix(".step"),
                 artifact_path=package, manifest=manifest, selector_bundle=SelectorBundle(manifest=manifest),
             )

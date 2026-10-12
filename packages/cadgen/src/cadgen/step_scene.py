@@ -18,11 +18,6 @@ __all__ = ["read_step", "read_scene", "StepScene", "Occurrence", "Selection"]
 
 EntityKind = Literal["shape", "face", "edge", "vertex"]
 
-def __getattr__(name: str):
-    if name in {"load_step_scene", "located_shape", "occurrence_selector_id", "scene_occurrence_shape"}:
-        raise ImportError(f"{name} has been removed; use read_scene(path), scene.resolve(ref) and selection.shape()")
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 
 def _resolve_input(step_path: Path | str, *, reader: str) -> Path:
     """Resolve a STEP a model asked for: it must exist, and must not be an
@@ -45,7 +40,7 @@ def read_scene(step_path: Path | str) -> StepScene:
     """Open one saved STEP revision, using its canonical native cache.
 
     A cache miss compiles the document, never its source. No tessellation or
-    display-surface extraction is required. STEP coordinates are in mm.
+    display derivation is required. STEP coordinates are in mm.
     Keep this scene open for repeated queries; calling again reads/hashes the
     document again so a replacement cannot masquerade as the old revision.
     """

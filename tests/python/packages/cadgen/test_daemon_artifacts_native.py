@@ -32,7 +32,7 @@ class NativeArtifactTransport(unittest.TestCase):
             "CADGEN_DAEMON_SPARES": "1", "CADGEN_COMPONENT_WORKERS": "1",
         }))
         from build123d import Solid
-        from cadgen.store import surfaces
+        from cadgen.store import parts
         from cadgen.store.build import build_tree_from_compound
         from cadgen.store.trees import capture_tree
 
@@ -40,9 +40,9 @@ class NativeArtifactTransport(unittest.TestCase):
         box.cad_face_ordinal_colors = {1: (0.1, 0.3, 0.8, 1.0)}
         self.tree, self.descriptor, _ = build_tree_from_compound(box, root_name="colored box")
         self.geometry = capture_tree(self.tree)[1]
-        self.producer = surfaces.producer_identity()
+        self.producer = parts.producer_identity()
         self.request = {
-            "kind": "surfaces", "tree": self.tree,
+            "kind": "display", "tree": self.tree,
             "cids": sorted(self.descriptor["components"]), "producer": self.producer,
         }
         self.source = self.root / "unrelated.py"
@@ -88,18 +88,15 @@ sys.addaudithook(audit)
 """
 
     def assert_geometry_and_result(self, result):
-        from cadgen.store import surfaces
-        from cadgen.store.objects import read_verified_object
+        from cadgen.store import meshes, parts
         from cadgen.store.trees import capture_tree
 
         self.assertEqual(set(result), set(self.request["cids"]))
         for cid, record in result.items():
-            self.assertEqual(record["producer"], self.producer)
-            self.assertEqual(record["surfaceInput"], surfaces.surface_input(self.descriptor["components"][cid], self.producer))
-            self.assertEqual(record["component"], self.descriptor["components"][cid]["contentHash"])
-            self.assertEqual(record["brep"], self.descriptor["components"][cid]["brep"])
-            index = surfaces.validate_surface_bytes(read_verified_object(record["object"]))
-            self.assertEqual(index["counts"]["faces"], 6)
+            key = parts.part_key(self.descriptor["components"][cid], self.producer)
+            self.assertEqual(parts.probe(key), record, "the job answers the part it stored")
+            self.assertEqual(meshes.body_facts(parts.read(key, "glb"))["part"], key)
+            self.assertEqual((record["glb"]["faceCount"], record["selectors"]["faceCount"]), (6, 6))
         self.assertEqual(capture_tree(self.tree)[1], self.geometry)
         self.assertFalse(self.audit_violation.exists())
         self.assertFalse((Path(self.store) / "index/model").exists())
@@ -162,32 +159,14 @@ sys.addaudithook(audit)
                 self.assertFalse(any(handler.is_alive() for handler in handlers))
                 self.assertTrue(all(process.poll() is not None for process in processes))
 
-    def test_real_daemon_native_surface_pins_errors_and_nested_one_slot(self):
-        nested = self.root / "nested-native"
-        prelude = self.source_guard() + f"""
-from cadgen.daemon import artifacts,broker
-from cadgen.store import surfaces
-original_derive=surfaces.derive
-def derive(*args,**kwargs):
-    lease=broker.current_lease()
-    assert lease is not None
-    nested=artifacts.resolve_artifact({{'kind':'producer'}},store_root=artifacts.store_path())
-    assert nested==surfaces.producer_identity() and broker.current_lease() is lease
-    Path({str(nested)!r}).write_text('completed under same lease')
-    return original_derive(*args,**kwargs)
-surfaces.derive=derive
-"""
-        with self.daemon(prelude) as (workers, ledger, processes):
+    def test_real_daemon_native_display_pins_and_errors(self):
+        with self.daemon(self.source_guard()) as (workers, ledger, processes):
             self.assertEqual(artifacts.submit_artifact({"kind": "producer"}, store_root=self.store).result(20), self.producer)
             result = artifacts.submit_artifact(self.request, store_root=self.store).result(20)
             self.assert_geometry_and_result(result)
-            expected = {row["surfaceInput"]: row["object"] for row in result.values()}
-            self.assertEqual(artifacts.submit_artifact({**self.request, "expected_objects": expected, "force": True}, store_root=self.store).result(20), result)
-            self.assertTrue(nested.exists())
             for changes, message in (
-                ({"producer": {**self.producer, "ocp": "different-known-runtime"}}, "pinned surface producer"),
+                ({"producer": {**self.producer, "ocp": "different-known-runtime"}}, "pinned producer"),
                 ({"cids": ["0" * 16]}, "unpinned component"),
-                ({"expected_objects": {key: "0" * 64 for key in expected}, "force": True}, "producer conflict"),
             ):
                 with self.subTest(changes=changes), self.assertRaisesRegex(artifacts.ArtifactJobError, message):
                     artifacts.submit_artifact({**self.request, **changes}, store_root=self.store).result(20)
@@ -196,22 +175,22 @@ surfaces.derive=derive
             self.assertEqual(len(processes), 1)
             self.assertTrue(all(row["model"] == "" for row in workers.snapshot()["workers"]))
             jobs = ledger.snapshot()
-            self.assertEqual(len(jobs), 6)
+            self.assertEqual(len(jobs), 4)
             self.assertTrue(all(row["subject"] == "" and row["outputs"] == [] and not row["editingProducer"] for row in jobs))
-            self.assertEqual(sum(row["state"] == "failed" for row in jobs), 3)
-            self.assertEqual(self.private.broker.snapshot()["granted"], 6, "inline nested native identity acquired an extra slot")
+            self.assertEqual(sum(row["state"] == "failed" for row in jobs), 2)
+            self.assertEqual(self.private.broker.snapshot()["granted"], 4, "one slot a job")
 
-    def test_real_transient_surface_keeps_coalesced_native_work_after_owner_detach(self):
+    def test_real_transient_display_derivation_keeps_coalesced_native_work_after_owner_detach(self):
         entered = self.root / "native-entered"
         release = self.root / "native-release"
         derived = self.root / "native-derived"
         script = self.source_guard() + f"""
 import time
 import build123d
-from cadgen._internal import component_package,surface_extract
+from cadgen._internal import component_package,topology_extract
 from cadgen.daemon import artifacts,broker
-from cadgen.store import surfaces
-original=surfaces.derive
+from cadgen.store import parts
+original=parts.derive
 def derive(*args,**kwargs):
     assert broker.current_lease() is not None
     Path({str(entered)!r}).write_text('entered')
@@ -222,7 +201,7 @@ def derive(*args,**kwargs):
     result=original(*args,**kwargs)
     Path({str(derived)!r}).write_text('derived')
     return result
-surfaces.derive=derive
+parts.derive=derive
 raise SystemExit(artifacts._main())
 """
         original_popen, processes = subprocess.Popen, []
@@ -258,11 +237,11 @@ raise SystemExit(artifacts._main())
 
             # The entered marker is deliberately emitted after the child's lazy native
             # imports. This test owns the detach/result handoff, not a cold OCP
-            # startup benchmark. Separate real surface derivation from broker
+            # startup benchmark. Separate real display derivation from broker
             # delivery so a failure names the stalled phase and its live state.
             self.wait_for(
                 lambda: derived.exists() or second.done(),
-                lambda: "native surface derivation did not finish after owner detach: "
+                lambda: "native display derivation did not finish after owner detach: "
                 f"child={processes[0].poll()}, broker={self.private.broker.snapshot()}, "
                 f"future_done={second.done()}",
                 timeout=60,
@@ -286,8 +265,8 @@ raise SystemExit(artifacts._main())
         entered, release = self.root / "daemon-entered", self.root / "daemon-release"
         prelude = self.source_guard() + f"""
 import time
-from cadgen.store import surfaces
-original=surfaces.derive
+from cadgen.store import parts
+original=parts.derive
 def derive(*args,**kwargs):
     Path({str(entered)!r}).write_text('entered')
     deadline=time.monotonic()+15
@@ -295,7 +274,7 @@ def derive(*args,**kwargs):
         if time.monotonic()>deadline: raise RuntimeError('test barrier')
         time.sleep(.005)
     return original(*args,**kwargs)
-surfaces.derive=derive
+parts.derive=derive
 """
         with self.daemon(prelude) as (workers, ledger, processes):
             first = artifacts.submit_artifact(self.request, store_root=self.store)

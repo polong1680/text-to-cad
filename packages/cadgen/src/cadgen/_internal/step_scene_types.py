@@ -15,11 +15,11 @@ ColorRGBA = tuple[float, float, float, float]
 class SelectorOptions:
     """How a build extracts a tree's topology.
 
-    Carries no mesh tolerance. A tree is tessellation-free — it
-    stores surfaces (``.surf``) and the client meshes them — so the only
-    option here with a consequence is which edge classes get built.
-    ``--mesh-tolerance`` belongs to the mesh EXPORT path (``MeshExportJob``),
-    which never reads this.
+    Carries no mesh tolerance. A tree is tessellation-free -- each part is
+    meshed once, at the one display tolerance, into its part record -- so the
+    only option here with a consequence is which edge classes get built. A mesh
+    tolerance belongs to the mesh EXPORT path (``MeshExportJob``), which never
+    reads this.
     """
 
     edge_deflection: float | None = None
@@ -89,12 +89,11 @@ class LoadedStepScene:
 class AdaptiveMeshResolution:
     """What the scene's topology says about how to RENDER it.
 
-    Not tessellation settings: there is one tessellator, it is JS, and it takes
-    its own relative tolerances. What survives here is the classification —
-    ``profile`` plus the ``hints`` it was computed from — because
-    ``_edge_visibility_classes_for_resolution`` turns the pair into the edge
-    classes a tree actually renders. The absolute deflection numbers this
-    once carried reached no mesher and are gone.
+    Not tessellation settings: cadgen's OCCT mesher (``occt_mesh``) takes its
+    own relative tolerances. This is the classification — ``profile`` plus the
+    ``hints`` it was computed from — which
+    ``_edge_visibility_classes_for_resolution`` turns into the edge classes a
+    tree renders.
     """
 
     profile: str

@@ -94,15 +94,17 @@ def _cmd_info(as_json: bool) -> int:
         "document": "document entries (bytes -> tree)",
         "output": "output entries (path -> model)",
         "component": "component entries",
-        "surface": "surface entries",
         "bounds": "bounding boxes and leaf layouts",
-        "mesh": "mesh entries",
+        "part": "part entries (a part's display mesh and selector table)",
         "drawing": "drawing render payloads",
+        "skin": "tube skins (a document's bending tubes, bound)",
+        "robot": "robot entries (a description -> its payload and primitive meshes)",
     }
     for kind, count in payload["index"].items():
         print(f"index/{kind:<10} {count} {labels[kind]}")
     for kind, count in payload["retired"].items():
-        print(f"index/{kind:<10} {count} entries of a kind this cadgen retired; the daemon removes them when idle, or `cadgen store gc`")
+        print(f"index/{kind:<10} {count} entries of a kind this cadgen retired; each goes a week after its last write "
+              "(the daemon when idle, or `cadgen store gc`)")
     for kind in payload["unknown"]:
         print(f"index/{kind:<10} a folder this cadgen does not know; it never touches it")
     if deferred:
@@ -142,8 +144,14 @@ def _cmd_why(target: str, as_json: bool) -> int:
 def _closure_file_label(rel: str, names: dict, own: dict) -> str:
     """``lib/geo.py[plane, cyl_along]`` for a sliced file (its reached names,
     the first six), the bare path for a file tracked whole, ``lib/__init__.py
-    (must stay absent)`` for a file the imports rely on not existing, and
-    ``./ (listing, less part.step)`` for a listed folder, less its own outputs."""
+    (must stay absent)`` for a file the imports rely on not existing,
+    ``./ (listing, less part.step)`` for a listed folder, less its own outputs,
+    and ``SIZE (environment variable)`` for a variable the model reads."""
+    from cadgen.store.closure import environment_name
+
+    variable = environment_name(rel)
+    if variable is not None:
+        return f"{variable} (environment variable)"
     if rel.startswith("!"):
         return f"{rel[1:]} (must stay absent)"
     if rel.endswith("/"):
@@ -217,6 +225,7 @@ def _cmd_gc(dry_run: bool, grace_hours: float, max_size: str | None, as_json: bo
         "removed": report.removed,
         "removedBytes": report.removed_bytes,
         "retired": report.retired,
+        "obsolete": report.obsolete,
         "retiredBytes": report.retired_bytes,
         "bytesBefore": report.bytes_before,
         "bytesAfter": report.bytes_after,
@@ -235,7 +244,9 @@ def _cmd_gc(dry_run: bool, grace_hours: float, max_size: str | None, as_json: bo
         return 0
     verb = "would remove" if dry_run else "removed"
     for kind, count in sorted(report.retired.items()):
-        print(f"index/{kind} is retired: {verb} {count} entries, then the objects only they named")
+        print(f"index/{kind} is retired: {verb} {count} entries a week old, then the objects only they named")
+    for kind, count in sorted(report.obsolete.items()):
+        print(f"{kind} entries another version of cadgen wrote are obsolete: {verb} {count}, then the objects only they named")
     if max_size is not None:
         if report.cap is None:
             print("no cap (0): nothing is evicted")
@@ -288,10 +299,11 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "gc",
         help="retire old index kinds, mark and sweep unreachable objects; with --max-size, evict to a cap first",
         description=(
-            "Removes the index kinds this cadgen no longer defines (index/op) and every object nothing reaches: "
-            "not a record's or a document's tree, not named by a mesh, surface, component, bounds or drawing "
+            "Removes the entries of the index kinds this cadgen no longer defines (index/op, index/surface, "
+            "index/selector, index/mesh) once a week old, and every object nothing reaches: "
+            "not a record's or a document's tree, not named by a part, component, bounds, drawing, skin or robot "
             "entry, and not written or claimed within the grace window. --max-size first evicts those derived "
-            "entries, least recently written first, until the store fits 80%% of the cap (the newest keep a "
+            "entries, least recently written first, until the store fits 80% of the cap (the newest keep a "
             "fifth of the cap when records and documents leave less room); records, document entries and "
             "output entries are never evicted. The daemon does the same when idle. A store a newer cadgen "
             "wrote to in the last 30 days is left to that cadgen, and nothing is removed."

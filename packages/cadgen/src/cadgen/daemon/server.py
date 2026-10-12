@@ -4,7 +4,7 @@ The supervisor owns a socket and a pool of warm workers (``cadgen.daemon.pool``)
 each a subprocess that imported cadgen / OCP / build123d once. It services
 directly-run @step/@dxf model scripts ("run") plus ``cadgen step build|compile``
 and ``cadgen stl|3mf|glb build`` invocations (snapshot orchestration stays in its
-caller; only its document compiles and surface derivations are pool jobs)
+caller; only its document compiles and display derivations are pool jobs)
 over a per-install unix socket (named pipe on Windows), so every
 call skips the multi-second interpreter+OCP startup. The supervisor itself never
 imports OCP: no amount of model badness can take it down.
@@ -399,7 +399,7 @@ def _handle_request(conn: transport.Channel, request: dict) -> None:
             finally:
                 _BROKER.detach(inflight)
             if code is None:
-                _JOBS.finish(job, 1, error="client disconnected")
+                _JOBS.finish(job, 1, cancelled=True)
                 return
             if is_artifact and inflight.get("result") is not None:
                 _JOBS.record_artifact_result(job, inflight["result"]["artifactResult"])
@@ -452,7 +452,7 @@ def _handle_request(conn: transport.Channel, request: dict) -> None:
 
     # An artifact job is never killed for its client. It is a pure function of immutable
     # pins that writes each result into the store as it goes, and the CAD Viewer cancels
-    # surface requests as a matter of course, so killing the worker threw away a warm
+    # part requests as a matter of course, so killing the worker threw away a warm
     # kernel (a replacement imports it again, ~2.6 s) to save a derivation that takes a
     # fraction of that. Nor does it run on for nobody: a request names up to 64
     # components, and one the browser left kept its worker deriving them for seconds while
@@ -514,7 +514,7 @@ def _handle_request(conn: transport.Channel, request: dict) -> None:
                 _JOBS.observe(frame)
             if is_artifact:
                 if "event" in frame:
-                    raise OSError("artifact worker emitted a source event")
+                    raise _WorkerBrokeProtocol("artifact worker emitted a source event")
                 if "artifactNext" in frame:
                     # Answered at once: the worker waits on it. Never relayed.
                     worker.send({"kind": "artifactNext", "goOn": wanted()})
@@ -527,7 +527,7 @@ def _handle_request(conn: transport.Channel, request: dict) -> None:
                         if inflight.get("result") is not None:
                             raise ValueError("duplicate artifact result")
                     except (ValueError, RuntimeError, TypeError) as exc:
-                        raise OSError(f"invalid artifact worker result: {exc}") from exc
+                        raise _WorkerBrokeProtocol(f"invalid artifact worker result: {exc}") from exc
                     _JOBS.record_artifact_result(job, frame["artifactResult"])
                     _BROKER.publish_artifact_result(inflight, frame["artifactResult"])
             event = frame.get("event")
@@ -560,6 +560,18 @@ def _handle_request(conn: transport.Channel, request: dict) -> None:
         with contextlib.suppress(OSError), send_lock:
             _send(conn, {"workerDied": {"pid": worker.pid, "detail": str(exc),
                                         "exitStatus": exc.exit_status}})
+    except _WorkerBrokeProtocol as exc:
+        # The worker answered, and the answer is wrong: the job FAILED, with that reason,
+        # while its client still listens. Never a cancel (the generic OSError below, a
+        # client gone), which hides a deterministic failure as "ask again". A worker that
+        # broke the protocol mid-job is not reused.
+        _log(f"{tool}: {exc}; replacing worker {worker.pid}")
+        if worker.alive():
+            worker.kill()
+        healthy, exit_code = False, 1
+        stderr_tail.append(f"\n{exc}\n")
+        with contextlib.suppress(OSError), send_lock:
+            _send(conn, {"stream": "stderr", "data": f"{exc}\n"})
     except OSError:
         # The CLIENT went away mid-job: a relay send failed before the watchdog's probe
         # did. Same answer as the watchdog's -- the orphaned job's worker is killed, never
@@ -573,13 +585,15 @@ def _handle_request(conn: transport.Channel, request: dict) -> None:
     finally:
         watchdog_done.set()
         watchdog.join(timeout=CLIENT_LIVENESS_INTERVAL_SECONDS + 1.0)
-        # A killed worker is not reusable; release() drops it and the pool respawns.
-        _POOL.release(worker, healthy=healthy and worker.alive())
+        # A killed worker is not reusable; release() drops it and the pool respawns. A job
+        # stopped because its caller left is no crash, though its worker is killed.
+        _POOL.release(worker, healthy=healthy and worker.alive(),
+                      cancelled=ended == "cancelled" or left.is_set())
         if is_artifact and exit_code == 0 and inflight.get("result") is None:
             exit_code = 1
             stderr_tail.append("artifact worker completed without an artifact result")
         reason = failure_message("".join(stderr_tail))[0] if exit_code != 0 else None
-        _JOBS.finish(job, exit_code, error=reason or None)
+        _JOBS.finish(job, exit_code, error=reason or None, cancelled=ended == "cancelled" or left.is_set())
         if inflight is not None:
             _BROKER.finish_entry(inflight, exit_code, error=reason or None)
 
@@ -590,6 +604,10 @@ def _handle_request(conn: transport.Channel, request: dict) -> None:
          f"(worker {worker.pid}{' extra' if worker.extra else ''})")
     with contextlib.suppress(OSError), send_lock:
         _send(conn, {"exit": exit_code})
+
+
+class _WorkerBrokeProtocol(Exception):
+    """A worker's frame the job cannot accept: a failure of the job, not of its client."""
 
 
 _INFLIGHT: set[threading.Thread] = set()
@@ -661,6 +679,14 @@ def _bind(address: str, *, wait: float = 0.0) -> transport.Server | None:
             return None
         time.sleep(LOCK_POLL_SECONDS)
     _DAEMON_LOCK = lock  # held while this daemon serves the address
+    try:
+        # A socket moved out of a deep state directory needs a folder no one else owns.
+        transport.claim_folder(address, create=True)
+    except transport.AddressUnusable as exc:
+        _log(f"cannot bind {address}: {exc}")
+        lock.release()
+        _DAEMON_LOCK = None
+        return None
     if transport.address_is_stale(address):
         transport.clear_address(address)
     while True:

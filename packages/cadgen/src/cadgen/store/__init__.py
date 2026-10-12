@@ -4,11 +4,12 @@ Layout (``STORE.md`` is the full account; read it before changing anything here)
 
     <store root>/
       objects/ab/cdef…        immutable, content-addressed: components and trees
-      index/document/<sha>    ARTIFACT side: sha256(file bytes) -> tree (+ mesh ledger)
-      index/model/<key>       records — one per model, keyed by its script path
+      index/document/<sha>-v<n>  ARTIFACT side: sha256(file bytes) -> tree (+ mesh ledger)
+      index/model/<key>-v<n>  records — one per model, keyed by its script path
+                              (v<n>: the entry's schema; another cadgen's live beside them)
       index/output/<key>      which model wrote the file at this path (badge only)
       index/bounds/<key>      bounding boxes and leaf layouts of stored geometry (store/bounds.py)
-      index/mesh/<key>        tessellation entries -> object hash
+      index/part/<key>-v<n>   a part's display data: its display mesh and selector table (store/parts.py)
 
 The two sides never point at each other from the artifact side: no object names
 a source, and a reader (door, viewer, snapshot) finds a tree through

@@ -66,7 +66,7 @@ class StoreCase(unittest.TestCase):
         path.write_text(MODEL_TEXT.format(name=name, size=size), encoding="utf-8")
         return path
 
-    def tree_for(self, label: str, payload: bytes = b"SURF\x00") -> str:
+    def tree_for(self, label: str, payload: bytes = b"BREP\x00") -> str:
         from cadgen.store.objects import put_object
         from cadgen.store.trees import put_tree
 
@@ -148,7 +148,7 @@ class GateTruthTable(StoreCase):
         self.assertIsNone(self.stale_clause(parent))
 
         # The child's result changed under the parent's pin.
-        self.record(child, tree=self.tree_for("pin", payload=b"SURF\x01"))
+        self.record(child, tree=self.tree_for("pin", payload=b"BREP\x01"))
         self.assertEqual(self.stale_clause(parent), 3)
 
         # The pin matches again but the child itself is stale (its source moved on).
@@ -171,7 +171,7 @@ class GateTruthTable(StoreCase):
         from cadgen.store.objects import object_path
 
         script = self.model("plate")
-        tree = self.tree_for("plate", payload=b"SURF\x02")
+        tree = self.tree_for("plate", payload=b"BREP\x02")
         self.record(script, tree=tree)
         self.assertIsNone(self.stale_clause(script))
         from cadgen.store.trees import get_tree
@@ -1035,10 +1035,12 @@ class StoreCli(StoreCase):
         old = time.time() - 7200
         for path in (object_path(cached), entry_path("drawing", "d" * 64)):
             os.utime(path, (old, old))
+        week_old = time.time() - 8 * 24 * 3600  # a retired kind's entry goes a week after its last write
+        os.utime(retired / ("e" * 64), (week_old, week_old))
 
         code, out = self.run_cli(["gc", "--dry-run", "--max-size", "1"])
         self.assertEqual(code, 0)
-        self.assertIn("index/op is retired: would remove 1 entries", out)
+        self.assertIn("index/op is retired: would remove 1 entries a week old", out)
         self.assertIn("would evict 1 drawing", out)
         self.assertTrue(has_object(cached) and (retired / ("e" * 64)).is_file(), "a dry run deletes nothing")
         code, out = self.run_cli(["info", "--json"])
@@ -1117,13 +1119,15 @@ class ChildrenByResult(StoreCase):
         (self.root / "STEP").mkdir()
         pin, arm = src / "link_pin.py", src / "link_arm.py"
 
+        # Only the builds are runs: a run that finds its model current takes exactly the
+        # gate's verdict (`stale`), which is asked directly, without a cold interpreter.
         self.assertEqual(self.run_model(arm), "built")
-        self.assertEqual(self.run_model(arm), "current")
-        self.assertEqual(self.run_model(pin), "current", "the child was built inline and recorded")
+        self.assertIsNone(self.stale_clause(arm))
+        self.assertIsNone(self.stale_clause(pin), "the child was built inline and recorded")
 
         pin.write_text(pin.read_text(encoding="utf-8").replace("height=12.0", "height=12.0 * 1.0"), encoding="utf-8")
         self.assertEqual(self.run_model(pin), "built", "a semantic edit rebuilds the child")
-        self.assertEqual(self.run_model(arm), "current", "identical geometry: the parent's pin still holds")
+        self.assertIsNone(self.stale_clause(arm), "identical geometry: the parent's pin still holds")
 
         # A publish claims everything its record names -- reused components and
         # a pinned child's tree alike -- so a sweep already running keeps it all

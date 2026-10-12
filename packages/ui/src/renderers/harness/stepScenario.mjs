@@ -11,32 +11,36 @@ import { chromium } from 'playwright';
 // `renderers/step/__fixtures__/step` (its README says how those bytes were made).
 //
 // A STEP is the one format whose load is a conversation rather than a download:
-// the catalog names a store view, the view names components by an immutable
-// `surfaceInput`, and only `POST /__cad/surfaces` turns those inputs into the
-// object digests the `.surf` bytes are fetched by. The descriptor the real store
-// route serves is NOT materialized, so that round trip is mandatory and this
-// server implements it exactly as `client/surfaceResolution.js` validates it:
-// the returned URL must be `/__cad/store` carrying the same `tree`,
-// `surfaceInput` and a lowercase 64-hex `object`.
+// the catalog names a store view, the view names each component's part (its key),
+// and the part store answers a part's record -- its display mesh and its selector
+// table (`components/<cid>.selectors.json`, cadgen's), each read by the part's key and
+// the object the record names -- for a part the store holds; `POST /__cad/parts`
+// answers the same record for one cadgen has to derive first, as this server does
+// for a cold store (`client/partResolution.js` validates it).
 
 const FIXTURE = new URL('../step/__fixtures__/step/', import.meta.url);
 
 const read = (name) => readFile(new URL(name, FIXTURE));
 
-/** Everything the fixture is, loaded once: the view, the sidecar and the surf bytes by object digest. */
+/**
+ * Everything the fixture is, loaded once: the view, the sidecar and cadgen's articulation of its
+ * kinematics, and each part by its key: its stored display mesh (`components/<cid>.glb`), decoded
+ * so the harness's store can serve it for any part, and its selector table.
+ */
 export async function loadStepFixture() {
+  const { decodeComponentTessellation } = await import('@text-to-cad/core/lib/parts/tessellationCache.js');
   const assembly = await read('assembly.json');
   const sidecar = JSON.parse(await read('hinge_block.step.json'));
+  const articulation = JSON.parse(await read('hinge_block.articulation.json'));
   const view = JSON.parse(assembly);
-  // `surfaceObject` is the digest of the `.surf` payload itself — the pin a real
-  // surface resolution hands back. Deriving it here keeps the fixture to the two
-  // files the client actually reads.
-  const surfaces = new Map();
+  const partData = new Map();
   for (const [cid, component] of Object.entries(view.components)) {
-    const bytes = await read(`components/${cid}.surf`);
-    surfaces.set(component.surfaceInput, { cid, bytes, object: createHash('sha256').update(bytes).digest('hex') });
+    const mesh = decodeComponentTessellation(new Uint8Array(await read(`components/${cid}.glb`)));
+    const table = await read(`components/${cid}.selectors.json`);
+    partData.set(component.part, { cid, mesh,
+      selectors: { bytes: table, object: createHash('sha256').update(table).digest('hex') } });
   }
-  return { assembly, view, sidecar, surfaces, file: 'hinge_block.step' };
+  return { assembly, view, sidecar, articulation, partData, file: 'hinge_block.step' };
 }
 
 const leaf = (id, name) => ({ children: [], id, leafPartIds: [id], name, nodeType: 'part' });
@@ -63,41 +67,46 @@ const ARM_COUNT = 24, BASE_AT = 19;
  * arms (20 × 20 × 10 against 10 × 8 × 8), so the box, the ground sized from it, the
  * depth range and the framing all change on that publish and on no other.
  *
- * Two surface inputs may name one surface object — that is what a content-addressed
- * store does with two inputs that produce identical geometry — so the twenty-four arms
- * are twenty-four components served from one `.surf`. They are HELD by input, one gate
- * per batch, so each publish is a test's to place rather than a race.
+ * Two parts may hold identical geometry -- that is what a content-addressed store does
+ * with two inputs that produce it -- so the twenty-four arms are twenty-four parts served
+ * from one arm's mesh. They are HELD by part, one gate per batch, so each publish is a
+ * test's to place rather than a race -- held the way cadgen holds a part it is still
+ * meshing: the store does not list it, and its part row answers `pending` until the
+ * gate opens, so the page asks again. No response is ever held
+ * open. A browser keeps six connections to a host and the loader runs up to eight lanes
+ * (`navigator.hardwareConcurrency`), so a held body could fill every connection and starve
+ * an unheld component's request queued behind it: the first batch would never land.
  */
 export function stageProgressiveFixture(fixture) {
   const original = fixture.view;
   const occurrenceNamed = name => original.occurrences.find(occurrence => occurrence.name === name);
   const armOccurrence = occurrenceNamed('arm'), baseOccurrence = occurrenceNamed('base');
   const arm = original.components[armOccurrence.component], base = original.components[baseOccurrence.component];
-  const armSurface = fixture.surfaces.get(arm.surfaceInput);
-  const surfaces = new Map(fixture.surfaces);
+  const armData = fixture.partData.get(arm.part);
+  const partData = new Map(fixture.partData);
   const components = {};
   const occurrences = [];
   const children = [];
-  const inputs = [];
+  const parts = [];
   const addArm = (index) => {
     const suffix = String(index).padStart(2, '0');
     const cid = `${arm.contentHash.slice(0, 14)}${suffix}`;
-    const surfaceInput = `${arm.surfaceInput.slice(0, 62)}${suffix}`;
-    components[cid] = { ...arm, contentHash: `${cid}${arm.contentHash.slice(16)}`, surfaceInput, brep: `components/${cid}.brep` };
-    surfaces.set(surfaceInput, { ...armSurface, cid });
+    const part = `${arm.part.slice(0, 62)}${suffix}${arm.part.slice(64)}`;
+    components[cid] = { ...arm, contentHash: `${cid}${arm.contentHash.slice(16)}`, part, brep: `components/${cid}.brep` };
+    partData.set(part, { ...armData, cid });
     const id = `o1.${index + 2}`;
     // Every arm at the origin: the box the first batch spans is one arm's, whichever
     // eight of them get there first.
     occurrences.push({ ...armOccurrence, id, name: `arm_${index + 1}`, component: cid, transform: baseOccurrence.transform });
     children.push(leaf(id, `arm_${index + 1}`));
-    inputs.push(surfaceInput);
+    parts.push(part);
   };
   for (let index = 0; index < ARM_COUNT; index += 1) {
     if (index === BASE_AT) {
       components[baseOccurrence.component] = base;
       occurrences.push({ ...baseOccurrence, id: 'o1.1' });
       children.push(leaf('o1.1', 'base'));
-      inputs.push(base.surfaceInput);
+      parts.push(base.part);
     }
     addArm(index);
   }
@@ -108,40 +117,39 @@ export function stageProgressiveFixture(fixture) {
     assembly: { root: { ...original.assembly.root, children, leafPartIds: children.map(child => child.id) } }
   };
   // Gate `a` is the second batch, gate `b` the one component that completes the load.
-  const heldInputs = new Map([
-    ...inputs.slice(8, 24).map(input => [input, 'a']),
-    ...inputs.slice(24).map(input => [input, 'b'])
+  const heldParts = new Map([
+    ...parts.slice(8, 24).map(part => [part, 'a']),
+    ...parts.slice(24).map(part => [part, 'b'])
   ]);
   // The same package with no `bbox`, as a descriptor that declares none is served: the viewer
   // frames its first batch and again once it is whole (`declare(false)` serves this one).
   const undeclared = { ...view };
   delete undeclared.bbox;
-  return { ...fixture, view, surfaces, heldInputs, assembly: Buffer.from(JSON.stringify(view)),
+  return { ...fixture, view, partData, heldParts, assembly: Buffer.from(JSON.stringify(view)),
     undeclaredAssembly: Buffer.from(JSON.stringify(undeclared)) };
 }
 
 /**
  * The base alone, staged as the SINGLE-PART STEP cadgen writes: one component, one occurrence,
- * `entryKind: "part"`, and — as in every such file cadgen writes — the part under a root product
- * OCCT named by its label entry, `=>[0:1:1:2]`, which the reader hands back as the occurrence's,
- * the root's and the view's name. It carries no sidecar: kinematics need two parts.
+ * `entryKind: "part"`, the part under a root product the STEP gives no name (so the view names
+ * the root by its id) and named as its own product names it, `base`. It carries no sidecar:
+ * kinematics need two parts.
  */
 export function stageSinglePartFixture(fixture) {
   const original = fixture.view;
-  const XCAF_ENTRY = '=>[0:1:1:2]';
   const base = original.occurrences.find(occurrence => occurrence.name === 'base');
   const view = {
     ...original,
-    entryKind: 'part', label: XCAF_ENTRY,
+    entryKind: 'part', label: 'o1',
     components: { [base.component]: original.components[base.component] },
-    occurrences: [{ ...base, id: 'o1.1', name: XCAF_ENTRY }],
+    occurrences: [{ ...base, id: 'o1.1' }],
     bbox: { min: [-10, -10, -5], max: [10, 10, 5] },
     stats: { ...original.stats, occurrenceCount: 1, shapeCount: 1 },
-    assembly: { root: { id: 'o1', name: XCAF_ENTRY, nodeType: 'assembly', leafPartIds: ['o1.1'],
-      children: [{ ...leaf('o1.1', XCAF_ENTRY) }] } }
+    assembly: { root: { id: 'o1', name: 'o1', nodeType: 'assembly', leafPartIds: ['o1.1'],
+      children: [{ ...leaf('o1.1', 'base') }] } }
   };
-  const surfaces = new Map([...fixture.surfaces].filter(([input]) => input === original.components[base.component].surfaceInput));
-  return { ...fixture, view, surfaces, sidecar: null, file: 'hinge_base.step', assembly: Buffer.from(JSON.stringify(view)) };
+  const partData = new Map([...fixture.partData].filter(([part]) => part === original.components[base.component].part));
+  return { ...fixture, view, partData, sidecar: null, articulation: null, file: 'hinge_base.step', assembly: Buffer.from(JSON.stringify(view)) };
 }
 
 /**
@@ -157,33 +165,35 @@ export function reviseFixture(fixture, revision) {
 }
 
 /**
- * The shared tessellation cache as an earlier open leaves it: every component of `fixture` at the
- * standard tier, tessellated here as the viewer would and keyed and encoded as the store keeps it.
- * Answers the routes the client reads it by: a probe, a batch read and a single read.
+ * cadgen's part store as the harness serves it: every component of `fixture` has its part -- its
+ * display mesh, encoded as the store keeps it for whatever part names it (a staged component shares
+ * its shape's mesh), and its selector table -- under the record that names both. `warm` holds every
+ * part already, as a build leaves it; otherwise a part is stored once a part request names its
+ * component (`derive`), as cadgen's one job derives what a cleared store lacks. Answers the routes
+ * the client reads it by: a probe, a batch read and a single read of either object.
  */
-async function warmTessellationCache(fixture) {
-  const [{ parseSurf }, { tessellateComponent }, cache] = await Promise.all([
-    import('@text-to-cad/core/lib/surf/container.js'),
-    import('@text-to-cad/core/lib/surf/tessellate.js'),
-    import('@text-to-cad/core/lib/surf/tessellationCache.js'),
+async function meshStore(fixture, { warm = false } = {}) {
+  const [cache, { encodeMeshFixture, partMeshFacts, partSelectorFacts }] = await Promise.all([
+    import('@text-to-cad/core/lib/parts/tessellationCache.js'),
+    import('@text-to-cad/core/lib/parts/testing.js'),
   ]);
-  const entries = new Map();
-  const tessellated = new Map();
-  for (const component of Object.values(fixture.view.components)) {
-    const surface = fixture.surfaces.get(component.surfaceInput);
-    if (!tessellated.has(surface.object)) {
-      const bytes = surface.bytes;
-      const { index, floats } = parseSurf(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-      tessellated.set(surface.object, { index, mesh: tessellateComponent(index, floats, {}) });
+  const stored = new Map();
+  const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+  const derive = (part) => {
+    const data = fixture.partData.get(part);
+    if (!data) return null;
+    if (!stored.has(part)) {
+      const bytes = encodeMeshFixture(data.mesh.component, { part });
+      const record = {
+        glb: { object: digest(bytes), ...partMeshFacts(bytes) },
+        selectors: { object: data.selectors.object, ...partSelectorFacts(data.selectors.bytes) },
+      };
+      stored.set(part, { bytes: Buffer.from(bytes), table: data.selectors.bytes, record });
     }
-    const { index, mesh } = tessellated.get(surface.object);
-    const bytes = cache.encodeComponentTessellation(mesh, {
-      surfaceInput: component.surfaceInput, surfaceObject: surface.object, tessellation: {},
-      partColor: Array.isArray(index.partColor) ? index.partColor : null, edgeClasses: cache.edgeClassesFromSurfIndex(index),
-    });
-    const row = cache.validateTessellationProbeRow({ schemaVersion: 1,
-      object: createHash('sha256').update(bytes).digest('hex'), ...cache.tessellationPayloadFacts(bytes) });
-    entries.set(cache.tessellationCacheKey(component.surfaceInput, {}), { bytes: Buffer.from(bytes), row });
+    return stored.get(part).record;
+  };
+  if (warm) {
+    for (const component of Object.values(fixture.view.components)) derive(component.part);
   }
   const binary = (response, bytes) => {
     response.setHeader('Content-Type', 'application/octet-stream');
@@ -191,20 +201,27 @@ async function warmTessellationCache(fixture) {
     response.end(bytes);
   };
   return {
-    probe: keys => ({ entries: Object.fromEntries(keys.filter(key => entries.has(key)).map(key => [key, entries.get(key).row])) }),
-    batch: (response, requested) => binary(response, Buffer.from(cache.encodeTessellationCacheBatch(requested.map(({ tessellationInput, object }) => {
-      const entry = entries.get(tessellationInput);
-      return entry?.row.object === object ? entry.bytes : null;
+    derive,
+    probe: parts => ({ entries: Object.fromEntries(parts.filter(part => stored.has(part)).map(part => [part, stored.get(part).record])) }),
+    batch: (response, requested) => binary(response, Buffer.from(cache.encodeTessellationCacheBatch(requested.map(({ part, object }) => {
+      const entry = stored.get(part);
+      return entry?.record.glb.object === object ? entry.bytes : null;
     })))),
-    read: (response, key) => { const entry = entries.get(key); if (entry) { binary(response, entry.bytes); return true; } return false; },
+    read: (response, part, role, object) => {
+      const entry = stored.get(part);
+      if (!entry || entry.record[role]?.object !== object) return false;
+      binary(response, role === 'glb' ? entry.bytes : entry.table);
+      return true;
+    },
   };
 }
 
 /**
- * The catalog entry the real scanner writes for this document, with the sidecar inline: the file
- * by its absolute path, under the `/models` the harness opens a bare `?file=` name in.
+ * The catalog entry the real scanner writes for this document, with what its sidecar means
+ * inline: the file by its absolute path, under the `/models` the harness opens a bare `?file=`
+ * name in.
  */
-export function stepCatalogEntry({ view, sidecar, assembly, file }) {
+export function stepCatalogEntry({ view, sidecar, articulation, assembly, file }) {
   if (!sidecar) {
     return { file: `/models/${file}`, kind: 'part', url: `/__cad/store?file=${view.tree}&documentHash=${view.documentHash}`,
       hash: view.tree, documentHash: view.documentHash, bytes: assembly.length };
@@ -216,16 +233,26 @@ export function stepCatalogEntry({ view, sidecar, assembly, file }) {
     hash: view.tree,
     documentHash: view.documentHash,
     bytes: assembly.length,
-    sourceUrl: `/${file}.json`,
-    // Inline: the renderer compiles kinematics and animation from the entry and
-    // never fetches the sidecar. The scanner only supplies it when the sidecar
-    // declares the current schema AND a `documentHash` equal to the digest of
-    // the STEP's bytes; a fixture failing either gate silently has no Position
-    // tab and no Animate tool.
-    sourceSidecar: sidecar,
+    // Inline, as the scanner publishes them: cadgen's articulation of the kinematics and the
+    // baked animation. The renderer reads both from the entry and never fetches the sidecar;
+    // the scanner only supplies them when the sidecar declares the current schema AND a
+    // `documentHash` equal to the digest of the STEP's bytes, so a fixture failing either gate
+    // silently has no Position tab and no Animate tool.
+    articulation,
+    animation: sidecar.animation,
     poseUrl: `/${file}.json`,
     animationHash: 'fixture-animation',
   };
+}
+
+/**
+ * How the real scanner lists a STEP whose bytes have no build: a bare part with no hash and no mesh,
+ * under bytes of its own, whatever the file held before. A rewritten file is listed so until its
+ * build lands, and for good when the build fails.
+ */
+function unbuiltEntry(listed) {
+  return { file: listed.file, kind: 'part', url: '/__cad/store?file=unbuilt-0f1e2d3c4b5a69788796a5b4', hash: '',
+    documentHash: createHash('sha256').update(`unbuilt:${listed.documentHash}`).digest('hex'), bytes: 0 };
 }
 
 /**
@@ -259,31 +286,35 @@ function harnessBundle() {
  *
  * @param {{ after: (cleanup: () => unknown) => void }} lifetime — a test context, or
  *   any object with its `after`, so one server and one browser can span a whole file.
- * @param {{ onRequest?: (url: URL, request: import('node:http').IncomingMessage) => void,
- *   progressive?: boolean }} [options]  `progressive` serves the twenty-five-component
- *   staging (`stageProgressiveFixture`) and HOLDS each batch after the first until
+ * @param {{ progressive?: boolean, singlePart?: boolean, warmCache?: boolean }} [options]
+ *   `progressive` serves the twenty-five-component staging (`stageProgressiveFixture`) and
+ *   HOLDS each batch after the first until
  *   `release(gate)` is called, so the package's three publishes are a test's to place
  *   rather than a race; `declare(false)` then serves its descriptor without the `bbox` it
  *   declares. `singlePart` serves the base alone as a cadgen single-part STEP
- *   (`stageSinglePartFixture`), its part named by an XCAF label entry. `warmCache` serves a shared
- *   tessellation cache that already holds every component (`warmTessellationCache`); without it
- *   the cache is cold, and every probe and read of it is a 404.
+ *   (`stageSinglePartFixture`), its part named `base` in `hinge_base.step`. `warmCache` serves a mesh
+ *   store that already holds every component's display mesh (`meshStore`); without it the
+ *   store is cold, and a component's mesh is made when its part request asks for it.
  */
-export async function serveStepHarness(t, { onRequest, progressive = false, singlePart = false, warmCache = false } = {}) {
+export async function serveStepHarness(t, { progressive = false, singlePart = false, warmCache = false } = {}) {
   const loaded = await loadStepFixture();
   const fixture = progressive ? stageProgressiveFixture(loaded) : singlePart ? stageSinglePartFixture(loaded) : loaded;
-  const tessellationCache = warmCache ? await warmTessellationCache(fixture) : null;
+  const meshes = await meshStore(fixture, { warm: warmCache });
   const entry = stepCatalogEntry(fixture);
   // The file as the catalog lists it now (`revise`), and every revision a page may still ask
   // for, by its tree.
   let current = fixture, listed = entry, revisions = 0;
   const views = new Map([[fixture.view.tree, fixture]]);
   // Each gate is a latch a test can close again (`hold`), so one server can serve the same
-  // package progressively more than once — an open, and then a REOPEN in a fresh page.
-  const opened = {}, gates = {};
-  const hold = name => { gates[name] = new Promise(resolve => { opened[name] = resolve; }); };
+  // package progressively more than once — an open, and then a REOPEN in a fresh page. A
+  // component behind a closed gate is one cadgen is still meshing (`stageProgressiveFixture`).
+  const closed = new Set();
+  const hold = name => { closed.add(name); };
+  const meshing = part => closed.has(fixture.heldParts?.get(part));
   for (const name of ['a', 'b']) hold(name);
   let declaring = true;
+  // Set by `fail()`: the file was saved again and its build failed.
+  let failing = false;
   let server, browser;
   const pages = new Set();
   t.after(async () => {
@@ -293,6 +324,9 @@ export async function serveStepHarness(t, { onRequest, progressive = false, sing
   const { bundle, bundledCss } = await harnessBundle();
   const css = await readFile(new URL('../../../dist/styles.css', import.meta.url));
   const requests = [];
+  // What the server is answering right now, and who waits for it to answer nothing (`idle`).
+  const answering = new Map();
+  let idlers = [];
 
   const json = (response, body) => { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(body)); };
   const notFound = (response) => { response.statusCode = 404; response.end(); };
@@ -305,65 +339,68 @@ export async function serveStepHarness(t, { onRequest, progressive = false, sing
   server = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://test');
     requests.push(`${request.method} ${url.pathname}${url.search}`);
-    onRequest?.(url, request);
+    answering.set(response, `${request.method} ${url.pathname}`);
+    response.once('close', () => {
+      answering.delete(response);
+      if (!answering.size) for (const done of idlers.splice(0)) done();
+    });
     if (url.pathname === '/harness.js') { response.setHeader('Content-Type', 'text/javascript'); response.end(bundle); return; }
     if (url.pathname === '/styles.css') { response.setHeader('Content-Type', 'text/css'); response.end(css); return; }
     if (url.pathname === '/harness.css') { response.setHeader('Content-Type', 'text/css'); response.end(bundledCss); return; }
-    if (url.pathname.endsWith('/__cad/catalog')) { json(response, { entries: [listed] }); return; }
+    if (url.pathname.endsWith('/__cad/catalog')) { json(response, { entries: [failing ? unbuiltEntry(listed) : listed] }); return; }
     if (url.pathname.endsWith('/__cad/server')) { json(response, { backend: 'cadgen' }); return; }
-    if (url.pathname.endsWith('/__cad/artifact')) { json(response, { state: 'compiled' }); return; }
-    if (url.pathname.endsWith('/__cad/surfaces')) {
+    if (url.pathname.endsWith('/__cad/artifact')) {
+      json(response, failing ? { state: 'failed', reason: 'build_failed', error: 'failed to read STEP file: the CAD kernel could not parse it' }
+        : { state: 'compiled' });
+      return;
+    }
+    if (url.pathname.endsWith('/__cad/parts/cancel')) { response.statusCode = 204; response.end(); return; }
+    if (url.pathname.endsWith('/__cad/parts')) {
       const body = await readBody(request);
       const shown = views.get(body.tree) || fixture;
+      // A held component is still being meshed: its row is pending under the request's
+      // subscriber token, as cadgen answers one, and the page asks again.
+      const job = body.job || `job-${createHash('sha256').update(JSON.stringify(body.components || [])).digest('hex').slice(0, 16)}`;
+      const waiting = (body.components || []).some(({ part }) => meshing(part));
       json(response, {
         viewId: shown.view.viewId,
-        components: Object.fromEntries((body.components || []).map(({ cid, surfaceInput }) => {
-          const surface = fixture.surfaces.get(surfaceInput);
-          if (!surface) return [cid, { surfaceInput, state: 'failed', error: `unknown surface input for ${cid}` }];
-          return [cid, { surfaceInput, state: 'ready', surfaceObject: surface.object, byteLength: surface.bytes.length,
-            url: `/__cad/store?tree=${shown.view.tree}&surfaceInput=${surfaceInput}&object=${surface.object}` }];
+        ...(waiting ? { job } : {}),
+        components: Object.fromEntries((body.components || []).map(({ cid, part }) => {
+          if (!fixture.partData.has(part)) return [cid, { part, state: 'failed', error: `unknown part for ${cid}` }];
+          if (meshing(part)) return [cid, { part, state: 'pending', job }];
+          return [cid, { part, state: 'ready', record: meshes.derive(part) }];
         })),
       });
       return;
     }
     if (url.pathname.endsWith('/__cad/store')) {
-      const object = url.searchParams.get('object');
-      if (object) {
-        const surface = [...fixture.surfaces.values()].find(entry => entry.object === object);
-        if (!surface) { notFound(response); return; }
-        // Held by INPUT, not by object: identical components share one object, and it is
-        // one component's download that waits. Only the BODY waits, so a metadata probe
-        // still answers and the component is slow rather than unsizeable.
-        const gate = fixture.heldInputs?.get(url.searchParams.get('surfaceInput'));
-        if (gate && request.method !== 'HEAD') await gates[gate];
-        response.setHeader('Content-Type', 'application/octet-stream');
-        response.setHeader('Content-Length', String(surface.bytes.length));
-        response.end(request.method === 'HEAD' ? undefined : surface.bytes);
-        return;
-      }
-      if (url.searchParams.get('file')?.endsWith('/assembly.json')) {
-        const shown = views.get(url.searchParams.get('file').split('/')[0]) || fixture;
+      const file = url.searchParams.get('file') || '';
+      if (file.endsWith('/assembly.json')) {
+        const shown = views.get(file.split('/')[0]) || fixture;
         response.setHeader('Content-Type', 'application/json');
         response.end(declaring || !shown.undeclaredAssembly ? shown.assembly : shown.undeclaredAssembly);
         return;
       }
-      notFound(response); return;
-    }
-    if (tessellationCache && url.pathname.endsWith('/__tess_cache/probe')) {
-      json(response, tessellationCache.probe((await readBody(request)).tessellationInputs || []));
+      notFound(response);
       return;
     }
-    if (tessellationCache && url.pathname.endsWith('/__tess_cache/batch')) {
-      tessellationCache.batch(response, (await readBody(request)).entries || []);
+    if (url.pathname.endsWith('/__tess_cache/probe')) {
+      // A part cadgen is still making is not in the store yet, though an earlier open made it:
+      // a reopen's held component is resolved, and waits, as a cold one does.
+      const parts = (await readBody(request)).parts || [];
+      json(response, meshes.probe(parts.filter(part => !meshing(part))));
       return;
     }
-    if (tessellationCache && request.method === 'GET' && url.pathname.endsWith('.tess')
-      && tessellationCache.read(response, decodeURIComponent(url.pathname.split('/__tess_cache/')[1].slice(0, -'.tess'.length)))) return;
-    // A cold cache: the tessellation cache probes and writes back, and a clean
-    // 404 is what "nothing warm here" looks like. Falling through to the HTML
-    // shell instead makes the probe throw on a page that is not JSON.
+    if (url.pathname.endsWith('/__tess_cache/batch')) {
+      meshes.batch(response, (await readBody(request)).entries || []);
+      return;
+    }
+    const object = request.method === 'GET' && /\/__tess_cache\/([^/]+?)\.(glb|selectors\.json)$/.exec(url.pathname);
+    if (object && meshes.read(response, decodeURIComponent(object[1]), object[2] === 'glb' ? 'glb' : 'selectors',
+      url.searchParams.get('object'))) return;
+    // A mesh the store does not hold: a clean 404, never the HTML shell, which a
+    // reader would fail to parse.
     if (url.pathname.includes('/__tess_cache/')) { notFound(response); return; }
-    if (url.pathname.endsWith(`/${fixture.file}.json`)) { if (current.sidecar) json(response, current.sidecar); else notFound(response); return; }
     if (/\.(woff2|ttf)$/.test(url.pathname)) { notFound(response); return; }
     response.setHeader('Content-Type', 'text/html');
     response.end('<!doctype html><html><head><title>Host title</title><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/harness.css"><style>body { margin: 0 } #root > div { width: 100vw !important; height: 100vh !important }</style></head><body><div id="root"></div><script type="module" src="/harness.js"></script></body></html>');
@@ -389,8 +426,8 @@ export async function serveStepHarness(t, { onRequest, progressive = false, sing
     page.setDefaultTimeout(timeout);
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
-    // No Worker: the surf tessellator falls back to the main thread, which is
-    // what `renderAssetClient` does for a host without one.
+    // No Worker: mesh decoding falls back to the main thread, which is what
+    // `renderAssetClient` does for a host without one.
     await page.addInitScript(() => { window.Worker = undefined; window.__cadPreviewChromeIdleMs = 5000; });
     if (record) await page.addInitScript(stored => { window.__cadTabRecord = stored; }, record);
     // A script of the test's own that must run before the app does (a render counter on
@@ -407,7 +444,13 @@ export async function serveStepHarness(t, { onRequest, progressive = false, sing
         return state?.revision === wanted && state.loading === false;
       }, revision);
     };
-    return { page, errors, pane: page.getByTestId('one'), update };
+    // The file saved again, broken: its build fails, and the catalog lists it as it lists any file
+    // with no build (`unbuiltEntry`) until it is saved once more. Resolves once the page has read it.
+    const fail = async () => {
+      failing = true;
+      await page.evaluate(() => window.cadHarness.a.client.refresh());
+    };
+    return { page, errors, pane: page.getByTestId('one'), update, fail };
   };
   /**
    * The file saved again (`reviseFixture`): the catalog lists the new revision from now on, and a
@@ -428,7 +471,21 @@ export async function serveStepHarness(t, { onRequest, progressive = false, sing
     pages.clear();
     current = fixture;
     listed = entry;
+    failing = false;
   };
-  return { open, closePages, requests, fixture, entry, revise, port: () => server.address().port, release: gate => opened[gate]?.(), hold,
+  /**
+   * Settles once the server is answering nothing, as one that never holds a request open soon is
+   * between a page's requests; fails naming what it still answers after `timeout` ms.
+   */
+  const idle = ({ timeout = 10000 } = {}) => new Promise((resolve, reject) => {
+    if (!answering.size) { resolve(); return; }
+    const done = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => {
+      idlers = idlers.filter(idler => idler !== done);
+      reject(new Error(`the server still holds ${[...new Set(answering.values())].join(', ')} open`));
+    }, timeout);
+    idlers.push(done);
+  });
+  return { open, closePages, requests, idle, fixture, release: gate => { closed.delete(gate); }, hold,
     declare: on => { declaring = on !== false; } };
 }

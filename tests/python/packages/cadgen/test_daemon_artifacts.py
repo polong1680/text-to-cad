@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
-import copy
 import io
 import json
 import os
@@ -21,14 +20,19 @@ from cadgen.daemon.jobs import JobLedger
 from tests.python.support.tmp_root import generated_cad_directory
 
 
-PRODUCER = {"scheme": 19, "surfFormat": 2, "build123d": "0.10", "ocp": "7.9.3.1", "cadqueryOcp": "7.9.3.1.1"}
+PRODUCER = {"build123d": "0.10", "ocp": "7.9.3.1", "cadqueryOcp": "7.9.3.1.1"}
 
 
-def surface_request(**changes):
-    request = {"kind": "surfaces", "tree": "a" * 64, "cids": ["b" * 16, "c" * 16],
-               "producer": dict(PRODUCER), "expected_objects": {"d" * 64: "e" * 64}, "force": False}
+def display_request(**changes):
+    request = {"kind": "display", "tree": "a" * 64, "cids": ["b" * 16, "c" * 16], "producer": dict(PRODUCER)}
     request.update(changes)
     return request
+
+
+def done(value):
+    future = concurrent.futures.Future()
+    future.set_result(value)
+    return future
 
 
 def noticing_log():
@@ -140,27 +144,25 @@ class AskingWorker:
 
 class ArtifactRequests(unittest.TestCase):
     def test_closed_requests_are_owned_sorted_and_include_every_pin_in_the_key(self):
-        request = surface_request(cids=["c" * 16, "b" * 16])
+        request = display_request(cids=["c" * 16, "b" * 16])
         normalized = artifacts.normalize_request(request)
         key = artifacts.request_key(request)
         self.assertEqual(normalized["cids"], ["b" * 16, "c" * 16])
-        self.assertEqual(key, artifacts.request_key(surface_request()))
+        self.assertEqual(key, artifacts.request_key(display_request()))
         request["producer"]["ocp"] = "changed"
-        request["expected_objects"]["d" * 64] = "f" * 64
-        self.assertEqual(normalized, surface_request())
+        self.assertEqual(normalized, display_request())
         for change in ({"tree": "f" * 64}, {"cids": ["b" * 16]}, {"producer": {**PRODUCER, "ocp": "new"}},
-                       {"producer": {**PRODUCER, "cadqueryOcp": "other"}}, {"force": True},
-                       {"expected_objects": {"d" * 64: "f" * 64}}, {"expected_objects": {"f" * 64: "e" * 64}}):
+                       {"producer": {**PRODUCER, "cadqueryOcp": "other"}}):
             with self.subTest(change=change):
-                self.assertNotEqual(key, artifacts.request_key(surface_request(**change)))
+                self.assertNotEqual(key, artifacts.request_key(display_request(**change)))
 
-    def test_unknown_fields_bad_pins_versions_and_nonboolean_force_fail_before_dispatch(self):
+    def test_unknown_fields_bad_pins_and_versions_fail_before_dispatch(self):
         invalid = [{"kind": "producer", "path": "source.py"}, {"kind": "compile"},
-                   surface_request(script="model.py"), surface_request(tree="part.step"),
-                   surface_request(cids=["B" * 16]), surface_request(cids=["b" * 16] * 2),
-                   surface_request(force=1), surface_request(expected_objects={"short": "e" * 64}),
-                   surface_request(producer={**PRODUCER, "ocp": "unknown"}),
-                   surface_request(producer={**PRODUCER, "scheme": True})]
+                   display_request(script="model.py"), display_request(tree="part.step"),
+                   display_request(cids=["B" * 16]), display_request(cids=["b" * 16] * 2), display_request(cids=[]),
+                   display_request(producer={**PRODUCER, "ocp": "unknown"}),
+                   # An older cadgen's producer named its extraction scheme; this one's is the kernel.
+                   display_request(producer={**PRODUCER, "scheme": 20})]
         with mock.patch.object(client, "run_artifact") as dispatch:
             for request in invalid:
                 with self.subTest(request=request), self.assertRaises(ValueError):
@@ -171,7 +173,7 @@ class ArtifactRequests(unittest.TestCase):
         script = """import sys
 from cadgen.daemon import artifacts, client, server, worker
 assert not any(k == 'OCP' or k.startswith('OCP.') or k == 'build123d' or k.startswith('build123d.') for k in sys.modules)
-assert 'cadgen.store.surfaces' not in sys.modules
+assert 'cadgen.store.parts' not in sys.modules
 print('kernel-free')
 """
         result = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True, timeout=20)
@@ -179,13 +181,13 @@ print('kernel-free')
         self.assertIn("kernel-free", result.stdout)
 
     def test_result_is_exactly_bound_and_has_no_native_or_mutable_alias(self):
-        request = surface_request()
+        request = display_request()
         value = {"components": ["b" * 16]}
         payload = artifacts.result_frame(request, value)
         value["components"].append("not retained")
         self.assertEqual(artifacts.validate_result(request, payload), {"components": ["b" * 16]})
         with self.assertRaises(artifacts.ArtifactJobError):
-            artifacts.validate_result(surface_request(force=True), payload)
+            artifacts.validate_result(display_request(tree="f" * 64), payload)
         with self.assertRaises(TypeError):
             artifacts.result_frame(request, object())
         with self.assertRaises(ValueError):
@@ -194,7 +196,7 @@ print('kernel-free')
     def test_ledger_never_parses_source_or_advertises_declared_outputs(self):
         ledger = JobLedger()
         with mock.patch("cadgen.daemon.jobs.declared_outputs", side_effect=AssertionError("source scan")):
-            job = ledger.start_artifact(surface_request(), store_root="/store/a", root_id="root", dependency=True)
+            job = ledger.start_artifact(display_request(), store_root="/store/a", root_id="root", dependency=True)
             legacy = ledger.start(tool="artifact", subject="/readable/source.py", argv=[])
         self.assertEqual(job["outputs"], [])
         self.assertEqual(legacy["subject"], "")
@@ -209,12 +211,12 @@ print('kernel-free')
 class ArtifactCoalescing(unittest.TestCase):
     def test_disconnect_before_claim_reply_retires_owner_and_attached_consumer(self):
         registry = broker.Broker(1)
-        request = {"kind": "inflight", "op": "claim", "artifact": surface_request(), "store_root": "/store"}
+        request = {"kind": "inflight", "op": "claim", "artifact": display_request(), "store_root": "/store"}
         gone = Connection()
         gone.disconnected.set()
         registry.handle(gone, request)
         self.assertEqual(registry.snapshot()["inflight"], 0)
-        _, owner = registry.claim_artifact_entry(surface_request(), store_root="/store")
+        _, owner = registry.claim_artifact_entry(display_request(), store_root="/store")
         with self.assertRaises(OSError):
             registry.handle(gone, request)
         self.assertEqual(owner["consumers"], 0)
@@ -223,24 +225,24 @@ class ArtifactCoalescing(unittest.TestCase):
 
     def test_typed_coalescing_separates_store_and_every_input_and_retires_by_owner(self):
         registry = broker.Broker(1)
-        owned, first = registry.claim_artifact_entry(surface_request(), store_root="/store/a")
+        owned, first = registry.claim_artifact_entry(display_request(), store_root="/store/a")
         self.assertTrue(owned)
-        owned, attached = registry.claim_artifact_entry(surface_request(cids=["c" * 16, "b" * 16]), store_root="/store/a")
+        owned, attached = registry.claim_artifact_entry(display_request(cids=["c" * 16, "b" * 16]), store_root="/store/a")
         self.assertFalse(owned)
         self.assertIs(attached, first)
-        for store, request in (("/store/b", surface_request()), ("/store/a", surface_request(force=True)),
-                               ("/store/a", surface_request(expected_objects={})),
-                               ("/store/a", surface_request(producer={**PRODUCER, "ocp": "other"}))):
+        for store, request in (("/store/b", display_request()), ("/store/a", display_request(tree="f" * 64)),
+                               ("/store/a", display_request(cids=["b" * 16])),
+                               ("/store/a", display_request(producer={**PRODUCER, "ocp": "other"}))):
             owns, entry = registry.claim_artifact_entry(request, store_root=store)
             self.assertTrue(owns)
             registry.finish_entry(entry, 0)
         self.assertTrue(registry.abandon(first), "an attached consumer preserves the producer")
         registry.detach(attached)
         self.assertTrue(registry.orphaned(first))
-        owned, replacement = registry.claim_artifact_entry(surface_request(), store_root="/store/a")
+        owned, replacement = registry.claim_artifact_entry(display_request(), store_root="/store/a")
         self.assertTrue(owned)
         registry.finish_entry(first, 1)
-        self.assertFalse(registry.claim_artifact_entry(surface_request(), store_root="/store/a")[0])
+        self.assertFalse(registry.claim_artifact_entry(display_request(), store_root="/store/a")[0])
         registry.finish_entry(replacement, 0)
         self.assertEqual(registry.snapshot()["inflight"], 0)
 
@@ -249,7 +251,7 @@ class ArtifactCoalescing(unittest.TestCase):
         running = ResultWorker(fail=fail)
         pool = mock.Mock()
         pool.acquire.return_value = running
-        request = {"tool": "artifact", "argv": [], "artifact": surface_request(), "store_root": "/store/a",
+        request = {"tool": "artifact", "argv": [], "artifact": display_request(), "store_root": "/store/a",
                    "root_id": "root", "dependency": True, "cwd": "/unrelated/source"}
         first, second = Connection(), Connection()
         with contextlib.ExitStack() as stack:
@@ -270,7 +272,7 @@ class ArtifactCoalescing(unittest.TestCase):
             owner.result(5)
             follower.result(5)
         pool.acquire.assert_called_once_with("", dependency=True, on_start=mock.ANY)
-        pool.release.assert_called_once_with(running, healthy=True)
+        pool.release.assert_called_once_with(running, healthy=True, cancelled=False)
         self.assertEqual(running.request["kind"], "artifact")
         self.assertEqual(running.request["argv"], [])
         self.assertEqual(first.frames[-1], {"exit": int(fail)})
@@ -291,13 +293,13 @@ class ArtifactCoalescing(unittest.TestCase):
         self.exercise_relay(fail=True)
 
     def test_a_cancelled_artifact_request_finishes_on_its_warm_worker(self):
-        # The CAD Viewer cancels surface requests as a matter of course. The derivation writes
+        # The CAD Viewer cancels part requests as a matter of course. The derivation writes
         # its result into the store, so the worker finishes it rather than being killed (a
         # replacement imports the kernel again), and an identical request meanwhile attaches.
         registry, ledger, pool = broker.Broker(1), JobLedger(), mock.Mock()
         running = ResultWorker()
         pool.acquire.return_value = running
-        request = {"tool": "artifact", "argv": [], "artifact": surface_request(), "store_root": "/store/a"}
+        request = {"tool": "artifact", "argv": [], "artifact": display_request(), "store_root": "/store/a"}
         cancelled, late = Connection(), Connection()
         log, noticed = noticing_log()
         with mock.patch.object(server, "_BROKER", registry), mock.patch.object(server, "_JOBS", ledger), \
@@ -318,7 +320,7 @@ class ArtifactCoalescing(unittest.TestCase):
             follower.result(5)
         self.assertFalse(running.killed)
         pool.acquire.assert_called_once_with("", dependency=False, on_start=mock.ANY)
-        pool.release.assert_called_once_with(running, healthy=True)
+        pool.release.assert_called_once_with(running, healthy=True, cancelled=False)
         self.assertEqual(late.frames[-1], {"exit": 0})
         self.assertEqual(sorted(job["state"] for job in ledger.snapshot()), ["done", "done"])
         self.assertEqual(registry.snapshot()["inflight"], 0)
@@ -328,7 +330,7 @@ class ArtifactCoalescing(unittest.TestCase):
         # an identical request has attached, and stop once neither does: a request the browser
         # left no longer holds its worker for the rest of its components. Nothing is killed.
         registry, ledger, pool = broker.Broker(1), JobLedger(), mock.Mock()
-        request = {"tool": "artifact", "argv": [], "artifact": surface_request(), "store_root": "/store/a"}
+        request = {"tool": "artifact", "argv": [], "artifact": display_request(), "store_root": "/store/a"}
         owner, other = Connection(), Connection()
         attached, detached = threading.Event(), threading.Event()
         claim, detach = registry.claim_artifact_entry, registry.detach
@@ -367,7 +369,7 @@ class ArtifactCoalescing(unittest.TestCase):
             follower[0].result()
         self.assertEqual(running.answers, [True, True, False])
         self.assertFalse(running.killed)
-        pool.release.assert_called_once_with(running, healthy=True)
+        pool.release.assert_called_once_with(running, healthy=True, cancelled=False)
         self.assertEqual(registry.snapshot()["inflight"], 0)
 
     def test_a_model_build_whose_client_left_is_still_stopped(self):
@@ -390,7 +392,32 @@ class ArtifactCoalescing(unittest.TestCase):
             gone.disconnected.set()
             build.result(5)
         self.assertTrue(running.killed, "a stopped build kept running")
-        pool.release.assert_called_once_with(running, healthy=False)
+        pool.release.assert_called_once_with(running, healthy=False, cancelled=True)
+
+    def test_a_wrong_result_fails_the_job_its_client_is_still_waiting_on(self):
+        # A result keyed to other inputs than the request's is the job failing, with its reason,
+        # to a client still connected -- never a cancel, which reads as "ask again", hid such a
+        # bug behind retries and killed a warm worker per request.
+        class WrongWorker(ResultWorker):
+            def frames(inner, **kwargs):
+                yield {"artifactResult": artifacts.result_frame(display_request(tree="f" * 64), {})}
+                yield {"exit": 0}
+
+        registry, ledger, pool, running = broker.Broker(1), JobLedger(), mock.Mock(), WrongWorker()
+        pool.acquire.return_value = running
+        connection = Connection()
+        with mock.patch.object(server, "_BROKER", registry), mock.patch.object(server, "_JOBS", ledger), \
+             mock.patch.object(server, "_POOL", pool), mock.patch.object(server, "_log"):
+            server._handle_request(connection, {"tool": "artifact", "argv": [], "artifact": display_request(),
+                                                "store_root": "/store"})
+        (job,) = ledger.snapshot()
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("invalid artifact worker result", job["error"])
+        self.assertEqual(connection.frames[-1], {"exit": 1})
+        self.assertTrue(any("invalid artifact worker result" in str(frame.get("data", "")) for frame in connection.frames))
+        self.assertTrue(running.killed, "a worker that broke the protocol was reused")
+        pool.release.assert_called_once_with(running, healthy=False, cancelled=False)
+        self.assertEqual(registry.snapshot()["inflight"], 0)
 
     def test_admission_failure_finishes_coalescing_without_starting_work(self):
         registry, ledger, pool = broker.Broker(1), JobLedger(), mock.Mock()
@@ -557,14 +584,14 @@ class ArtifactLeases(unittest.TestCase):
         env = mock.patch.dict(os.environ, {**self.private.env(), "CADGEN_CACHE_DIR": self.root, "CADGEN_DAEMON": "0"})
         env.start()
         self.addCleanup(env.stop)
-        self.fake = types.ModuleType("cadgen.store.surfaces")
+        self.fake = types.ModuleType("cadgen.store.parts")
         self.fake.producer_identity = mock.Mock(return_value=dict(PRODUCER))
         self.fake.derive = mock.Mock(return_value={"components": ["b" * 16]})
         import cadgen.store
 
         stack = self.enterContext(contextlib.ExitStack())
-        stack.enter_context(mock.patch.dict(sys.modules, {"cadgen.store.surfaces": self.fake}))
-        stack.enter_context(mock.patch.object(cadgen.store, "surfaces", self.fake, create=True))
+        stack.enter_context(mock.patch.dict(sys.modules, {"cadgen.store.parts": self.fake}))
+        stack.enter_context(mock.patch.object(cadgen.store, "parts", self.fake, create=True))
 
     def settled(self):
         deadline = time.monotonic() + 3
@@ -574,19 +601,6 @@ class ArtifactLeases(unittest.TestCase):
                 return snapshot
             time.sleep(.005)
         self.fail(f"leaked accounting: {snapshot}")
-
-    def test_matching_accounted_worker_executes_inline_under_the_same_one_slot(self):
-        with broker.held("parent", required=True), artifacts.worker_context(self.root), \
-             mock.patch.object(client, "run_artifact", side_effect=AssertionError("nested dispatch")):
-            before = self.private.broker.snapshot()["granted"]
-            self.assertEqual(artifacts.resolve_artifact({"kind": "producer"}, store_root=self.root), PRODUCER)
-            self.assertEqual(artifacts.resolve_artifact(surface_request(), store_root=self.root), {"components": ["b" * 16]})
-            self.assertEqual(self.private.broker.snapshot()["granted"], before)
-            self.assertEqual(self.private.broker.snapshot()["running"], 1)
-        self.assertEqual(self.settled()["peakRunning"], 1)
-        self.fake.derive.assert_called_once_with("a" * 64, ["b" * 16, "c" * 16], producer=PRODUCER,
-                                               expected_objects={"d" * 64: "e" * 64}, force=False,
-                                               keep_going=None)
 
     def test_worker_source_isolation_and_failure_release_real_lease(self):
         readable = Path(self.root) / "unrelated.py"
@@ -599,13 +613,13 @@ class ArtifactLeases(unittest.TestCase):
                 raise AssertionError("unrelated source read")
             return original_open(path, *args, **kwargs)
 
-        request = {"tool": "artifact", "argv": [], "artifact": surface_request(), "store_root": self.root,
+        request = {"tool": "artifact", "argv": [], "artifact": display_request(), "store_root": self.root,
                    "cwd": self.root, "env": {}}
         with mock.patch.object(worker, "_emit", side_effect=frames.append), mock.patch("builtins.open", side_effect=guard), \
              mock.patch.object(worker, "_evict_first_party_modules", side_effect=AssertionError("source hygiene scan")), \
              mock.patch("cadgen.metadata.parse_generator_metadata", side_effect=AssertionError("source metadata")):
             self.assertEqual(worker._run(request), 0)
-            self.fake.derive.side_effect = RuntimeError("surface producer failed")
+            self.fake.derive.side_effect = RuntimeError("producer failed")
             self.assertEqual(worker._run(request), 1)
         self.assertEqual(sum("artifactResult" in frame for frame in frames), 1)
         self.assertEqual(self.settled()["granted"], 2)
@@ -631,7 +645,7 @@ class ArtifactLeases(unittest.TestCase):
         self.assertEqual(snapshot["peakRunning"], 1)
         self.assertEqual(snapshot["granted"], 3)
 
-    def test_different_store_and_other_thread_never_borrow_the_parent_native_lease(self):
+    def test_a_job_submitted_under_a_held_slot_runs_while_its_caller_waits_in_it(self):
         endpoint = (self.private.address, self.private.key)
         calls = []
 
@@ -641,7 +655,7 @@ class ArtifactLeases(unittest.TestCase):
                 return {"root": root}
 
         with mock.patch.object(artifacts, "_run_transient", side_effect=dispatch):
-            with broker.held("parent", required=True), artifacts.worker_context(self.root):
+            with broker.held("parent", required=True):
                 other_root = str(Path(self.root) / "other")
                 self.assertEqual(artifacts.resolve_artifact({"kind": "producer"}, store_root=other_root), {"root": other_root})
                 holder = []
@@ -662,7 +676,7 @@ class ArtifactLeases(unittest.TestCase):
 
     def test_transient_broker_claim_retains_typed_result_for_late_clients(self):
         endpoint = (self.private.address, self.private.key)
-        request = surface_request()
+        request = display_request()
         owner = broker.claim_artifact(request, store_root=self.root, endpoint=endpoint)
         payload = artifacts.result_frame(request, {"complete": True})
         broker.report_artifact_result(owner[1], payload)
@@ -699,10 +713,9 @@ class ArtifactLeases(unittest.TestCase):
         script = f"""import json,os,sys,time,types
 from pathlib import Path
 from cadgen.daemon import artifacts,broker
-module=types.ModuleType('cadgen.store.surfaces')
+module=types.ModuleType('cadgen.store.parts')
 def identity():
     assert broker.current_lease() is not None
-    assert artifacts._WORKER.root == artifacts.store_path()
     Path({str(entered)!r}).write_text('entered')
     deadline=time.monotonic()+5
     while not Path({str(release)!r}).exists():
@@ -745,7 +758,7 @@ raise SystemExit(artifacts._main())
         script = f"""import os,sys,time,types
 from pathlib import Path
 from cadgen.daemon import artifacts,broker
-module=types.ModuleType('cadgen.store.surfaces')
+module=types.ModuleType('cadgen.store.parts')
 def identity():
     assert broker.current_lease() is not None
     Path({str(entered)!r}).write_text('entered')
@@ -808,7 +821,7 @@ raise SystemExit(artifacts._main())
         script = f"""import sys,time,types
 from pathlib import Path
 from cadgen.daemon import artifacts,broker
-module=types.ModuleType('cadgen.store.surfaces')
+module=types.ModuleType('cadgen.store.parts')
 def identity():
     assert broker.current_lease() is not None
     Path({str(entered)!r}).write_text('entered')
@@ -958,22 +971,23 @@ class SupervisedDerivation(unittest.TestCase):
         root = str(Path(temp.name).resolve())
         self.enterContext(mock.patch.dict(os.environ, {**private.env(), "CADGEN_CACHE_DIR": root, "CADGEN_DAEMON": "0"}))
         from build123d import Box, Compound, Pos
-        from cadgen.store import surfaces
+        from cadgen.store import parts
         from cadgen.store.build import build_tree_from_compound
 
-        parts = Compound(children=[Pos(20 * index, 0, 0) * Box(1 + index, 2, 3) for index in range(3)])
-        tree, descriptor, _ = build_tree_from_compound(parts, root_name="parts")
-        producer, cids = surfaces.producer_identity(), sorted(descriptor["components"])
+        boxes = Compound(children=[Pos(20 * index, 0, 0) * Box(1 + index, 2, 3) for index in range(3)])
+        tree, descriptor, _ = build_tree_from_compound(boxes, root_name="parts")
+        producer, cids = parts.producer_identity(), sorted(descriptor["components"])
         request = {"tool": "artifact", "argv": [], "store_root": root,
-                   "artifact": {"kind": "surfaces", "tree": tree, "cids": cids, "producer": producer}}
+                   "artifact": {"kind": "display", "tree": tree, "cids": cids, "producer": producer}}
+        # Asked before the first part's derivation, then before the second's.
         answers = io.StringIO('{"kind": "artifactNext", "goOn": true}\n{"kind": "artifactNext", "goOn": false}\n')
         frames = []
         with mock.patch.object(worker, "_emit", side_effect=frames.append), mock.patch.object(sys, "stdin", answers):
             self.assertEqual(worker._run(request, supervised=True), 0)
         self.assertEqual(frames[:2], [{"artifactNext": True}] * 2)
         self.assertEqual(list(frames[2]["artifactResult"]["result"]), cids[:1])
-        self.assertEqual([surfaces.lookup(descriptor["components"][cid], producer) is not None for cid in cids],
-                         [True, False, False])
+        self.assertEqual([parts.probe(parts.part_key(descriptor["components"][cid], producer)) is not None
+                          for cid in cids], [True, False, False])
 
 
 if __name__ == "__main__":

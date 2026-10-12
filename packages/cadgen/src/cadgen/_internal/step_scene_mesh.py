@@ -127,7 +127,7 @@ def scene_to_build123d_compound(scene: LoadedStepScene, *, label: str | None = N
             if face_colors:
                 # Ordinal-keyed (TopExp.MapShapes order) so the value survives the
                 # BinTools round-trip to component-build workers and lands in the
-                # component's .surf, which keys face colors by ordinal.
+                # part's display data, which keys face colors by ordinal.
                 shape.cad_face_ordinal_colors = _face_colors_by_ordinal(
                     scene.prototype_shapes[node.prototype_key], face_colors)
         return shape
@@ -170,12 +170,6 @@ def import_step(step_path: Path, *, label: str | None = None) -> Any:
     # name, and deriving it from the path would make identical STEP content
     # produce different trees depending on where the file happens to live.
     return scene_to_build123d_compound(scene, label=label)
-
-
-def scene_occurrence_prototype_shape(scene: LoadedStepScene, node: OccurrenceNode) -> Any:
-    if node.prototype_key is None or node.prototype_key not in scene.prototype_shapes:
-        raise RuntimeError(f"Occurrence {occurrence_selector_id(node)} has no prototype shape")
-    return scene.prototype_shapes[node.prototype_key]
 
 
 def prototype_topology(shape: Any) -> dict[str, Any]:
@@ -330,9 +324,9 @@ def adaptive_mesh_resolution_from_hints(hints: dict[str, Any]) -> AdaptiveMeshRe
     for edge rendering: ``_edge_visibility_classes_for_resolution`` turns
     profile + hints into the visibility classes the tree is built with, so a
     scene that lands on ``coarse-assembly`` renders feature edges only. It
-    decides nothing about tessellation — the one tessellator is JS
-    (``packages/core/src/lib/surf/tessellate.js``) and takes relative
-    tolerances of its own.
+    decides nothing about meshing — the one mesher is OCCT's
+    (``cadgen._internal.occt_mesh``), at the relative tolerances each request
+    names.
 
     The thresholds below are therefore a complexity ladder, not a quality
     ladder: each rung says "this much topology", and only the top two rungs

@@ -1,7 +1,8 @@
-"""Internal artifact operations, independent of source models and document paths.
-
-Only workers import the native surface producer. Requests contain immutable pins,
-never a script, a declared output, or an instruction to run arbitrary Python.
+"""Build-pool artifact jobs, independent of source models and document paths: this
+runtime's producer (``kind: producer``), and the display data of the parts a
+view found missing from the store (``kind: display``: one request, one job, one
+worker). Only workers import the native producer. Requests contain immutable
+pins, never a script, a declared output, or an instruction to run arbitrary Python.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from cadgen.daemon import broker
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _CID = re.compile(r"[0-9a-f]{16}\Z")
-_PRODUCER_FIELDS = {"scheme", "surfFormat", "build123d", "ocp", "cadqueryOcp"}
+_PRODUCER_FIELDS = {"build123d", "ocp", "cadqueryOcp"}
 
 
 class ArtifactJobError(RuntimeError):
@@ -41,12 +42,8 @@ def _digest(value, name, pattern=_HASH):
 
 def _producer(value):
     if not isinstance(value, dict) or set(value) != _PRODUCER_FIELDS:
-        raise ValueError("artifact producer requires exactly scheme, surfFormat, build123d, ocp, cadqueryOcp")
+        raise ValueError("artifact producer requires exactly build123d, ocp, cadqueryOcp")
     result = {}
-    for name in ("scheme", "surfFormat"):
-        if type(value[name]) is not int or value[name] <= 0:
-            raise ValueError(f"artifact producer {name} must be a positive integer")
-        result[name] = value[name]
     for name in ("build123d", "ocp", "cadqueryOcp"):
         item = value[name]
         if not isinstance(item, str) or not item.strip() or item.lower() in {"unknown", "none"}:
@@ -62,25 +59,16 @@ def normalize_request(request):
     kind = request.get("kind")
     if kind == "producer" and set(request) == {"kind"}:
         return {"kind": "producer"}
-    fields = {"kind", "tree", "cids", "producer", "expected_objects", "force"}
-    required = {"kind", "tree", "cids", "producer"}
-    if kind != "surfaces" or not required <= set(request) or set(request) - fields:
-        raise ValueError("artifact request must be producer or surfaces with closed immutable inputs")
+    if kind != "display" or set(request) != {"kind", "tree", "cids", "producer"}:
+        raise ValueError("artifact request must be producer, or display with exactly tree, cids and producer")
     cids = request["cids"]
     if not isinstance(cids, (list, tuple)) or not cids:
         raise ValueError("artifact cids must be a nonempty list")
     cids = [_digest(cid, "cid", _CID) for cid in cids]
     if len(cids) != len(set(cids)):
         raise ValueError("artifact cids must not contain duplicates")
-    expected = request.get("expected_objects", {})
-    if not isinstance(expected, dict):
-        raise ValueError("artifact expected_objects must map surface-input pins to object pins")
-    expected = {_digest(key, "surface input"): _digest(value, "surface object") for key, value in expected.items()}
-    force = request.get("force", False)
-    if type(force) is not bool:
-        raise ValueError("artifact force must be a boolean")
     return {"kind": kind, "tree": _digest(request["tree"], "tree"), "cids": sorted(cids),
-            "producer": _producer(request["producer"]), "expected_objects": dict(sorted(expected.items())), "force": force}
+            "producer": _producer(request["producer"])}
 
 
 def request_key(request):
@@ -116,7 +104,8 @@ _WORKER = threading.local()
 
 @contextlib.contextmanager
 def worker_context(root):
-    """An actual worker request's store; never inferred from a subject/env flag."""
+    """The store this thread's job is for: a daemon worker's request. An artifact job the
+    thread submits while it runs is that job's dependency (``client.artifact_payload``)."""
     previous = getattr(_WORKER, "root", None)
     _WORKER.root = store_path(root)
     try:
@@ -125,24 +114,17 @@ def worker_context(root):
         _WORKER.root = previous
 
 
-def _can_inline(root):
-    return (getattr(_WORKER, "root", None) == root and broker.current_lease() is not None
-            and store_path() == root)
-
-
 def execute(request, *, keep_going=None):
     """Worker-only native entry. Source and model lookup are absent by design.
 
-    ``keep_going`` is asked before each derivation (``surfaces.derive``): a daemon
-    worker's asks its supervisor whether anyone still wants the job."""
+    ``keep_going`` is asked before each part (``parts.derive``): a daemon worker's asks
+    its supervisor whether anyone still wants the job."""
     request = normalize_request(request)
-    from cadgen.store import surfaces
+    from cadgen.store import parts
 
     if request["kind"] == "producer":
-        return surfaces.producer_identity()
-    return surfaces.derive(request["tree"], request["cids"], producer=request["producer"],
-                           expected_objects=request["expected_objects"], force=request["force"],
-                           keep_going=keep_going)
+        return parts.producer_identity()
+    return parts.derive(request["tree"], request["cids"], producer=request["producer"], keep_going=keep_going)
 
 
 class ArtifactFuture(Future):
@@ -199,7 +181,7 @@ class ArtifactFuture(Future):
 
     def result(self, timeout=None):
         # The calling thread owns its lease. A background dispatcher must never
-        # release it, and an already finished inline result need not yield it.
+        # release it, and an already finished result need not yield it.
         if self.done():
             return copy.deepcopy(super().result(timeout))
         with broker.yielded():
@@ -299,8 +281,9 @@ def _run_transient(request, root, env, endpoint, *, subscriber=None):
                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="backslashreplace")
         if orphaned.is_set():
             raise ArtifactDetached("artifact producer lost its last subscriber")
+        # No "env": the worker was started with its caller's environment and keeps it.
         payload = {"tool": "artifact", "argv": [], "artifact": request, "store_root": root,
-                   "env": {}, "root_id": env.get("CADGEN_ROOT_ID")}
+                   "root_id": env.get("CADGEN_ROOT_ID")}
         process.stdin.write(json.dumps(payload) + "\n")
         process.stdin.close()
         exit_seen = None
@@ -349,18 +332,11 @@ def _run_transient(request, root, env, endpoint, *, subscriber=None):
 
 
 def submit_artifact(request, *, store_root=None):
-    """Start a typed artifact operation without importing the CAD kernel here."""
+    """Start a typed artifact operation as ONE build-pool job, on a thread of its own,
+    without importing the CAD kernel here."""
     request = normalize_request(request)
     root = store_path(store_root)
     future = ArtifactFuture()
-    if _can_inline(root):
-        future._begin()
-        try:
-            future._complete(validate_result(request, result_frame(request, execute(request))))
-        except Exception as exc:
-            future._complete(error=exc)
-        return future
-
     from cadgen.daemon import client
     from cadgen.daemon.executors import use_daemon
 
@@ -399,7 +375,7 @@ def resolve_artifact(request, *, store_root=None):
 
 
 def _main():
-    # Private one-shot worker, not an author CLI. No import of store.surfaces
+    # Private one-shot worker, not an author CLI. No import of store.parts
     # occurs until worker._run has acquired the required broker lease.
     from cadgen.daemon import worker
 

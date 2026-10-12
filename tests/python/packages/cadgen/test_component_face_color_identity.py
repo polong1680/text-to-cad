@@ -1,4 +1,4 @@
-"""SURF identity includes face colors; immutable BREP identity remains shared."""
+"""A part's identity includes face colors; immutable BREP identity remains shared."""
 
 from __future__ import annotations
 
@@ -118,7 +118,7 @@ class ComponentFaceColorIdentityTest(unittest.TestCase):
         self.assertEqual(len({cid for document in documents for cid in document["components"]}), 3)
         self.assertEqual(len({component["brep"] for document in documents
                               for component in document["components"].values()}), 1)
-        # Subsequent writes leave the earlier immutable colored SURFs intact.
+        # Subsequent writes leave the earlier immutable colored parts intact.
         self.assertEqual(self.faces(next(iter(documents[0]["components"].values()))), {1: RED})
         self.assertEqual(self.faces(next(iter(documents[1]["components"].values()))), {1: BLUE})
 
@@ -126,7 +126,7 @@ class ComponentFaceColorIdentityTest(unittest.TestCase):
         from importlib import import_module
 
         from build123d import Compound, Location
-        from cadgen._internal import surface_extract
+        from cadgen._internal import topology_extract
         from cadgen.store.build import build_tree_from_compound
 
         materialization = import_module("cadgen.store.materialize")
@@ -135,10 +135,10 @@ class ComponentFaceColorIdentityTest(unittest.TestCase):
         tree, _, _ = build_tree_from_compound(Compound(children=[red, blue, repeated]), root_name="colors")
         from cadgen._internal import component_package
         with mock.patch.object(component_package, "decode_geometry_component", wraps=component_package.decode_geometry_component) as decoded:
-            with mock.patch.object(surface_extract, "read_surf", wraps=surface_extract.read_surf) as surfaces:
+            with mock.patch.object(topology_extract, "extract_topology_facts", wraps=topology_extract.extract_topology_facts) as extracted:
                 first = materialization.materialize(tree)
         self.assertEqual(decoded.call_count, 1)
-        self.assertEqual(surfaces.call_count, 0)
+        self.assertEqual(extracted.call_count, 0)
         self.assertEqual([child.cad_face_ordinal_colors for child in first.children], [{1: RED}, {1: BLUE}, {1: RED}])
         second = materialization.materialize(tree)
         first.children[0].cad_face_ordinal_colors[1] = BLUE

@@ -120,24 +120,6 @@ class LazyCompound(Compound):
         return self.__dict__.get("_lazy_shape") is not None
 
     @property
-    def cad_material(self):
-        raise AttributeError(
-            "cad_material authoring was removed; declare named materials with "
-            "@step(materials={'definitions': ..., 'assignments': ...})"
-        )
-
-    @cad_material.setter
-    def cad_material(self, value) -> None:
-        raise AttributeError(
-            "cad_material authoring was removed; declare named materials with "
-            "@step(materials={'definitions': ..., 'assignments': ...})"
-        )
-
-    @cad_material.deleter
-    def cad_material(self) -> None:
-        raise AttributeError("cad_material authoring was removed; remove the @step materials= assignment instead")
-
-    @property
     def cad_face_ordinal_colors(self):
         """The pinned root face colors, with the same ownership as material."""
         if "cad_face_ordinal_colors" not in self.__dict__ and not self._forced:
@@ -337,9 +319,10 @@ class LazyCompound(Compound):
                 if job.result_ready:
                     tree = job.wait_result()
                 else:
+                    from cadgen._internal.build_timing import waiting_for_children
                     from cadgen.daemon.broker import yielded
 
-                    with yielded():
+                    with waiting_for_children(), yielded():
                         tree = job.wait_result()
             except RuntimeError as exc:
                 raise ChildBuildError(
@@ -365,9 +348,10 @@ class LazyCompound(Compound):
         if job.done:
             code = job.wait()
         else:
+            from cadgen._internal.build_timing import waiting_for_children
             from cadgen.daemon.broker import yielded
 
-            with yielded():
+            with waiting_for_children(), yielded():
                 code = job.wait()
         if code != 0:
             raise ChildBuildError(
@@ -378,6 +362,14 @@ class LazyCompound(Compound):
     def _force(self) -> None:
         if self._lazy_forcing:
             raise RuntimeError(f"child model {self.model_name} forced re-entrantly")
+        from cadgen._internal.build_timing import cadgen_work
+
+        # Waiting for the child and loading its geometry is cadgen's time, not the
+        # parent's model code (cadgen._internal.build_timing).
+        with cadgen_work():
+            self._force_now()
+
+    def _force_now(self) -> None:
         _ready_children.prepare_for(self)
         self._lazy_forcing = True
         try:

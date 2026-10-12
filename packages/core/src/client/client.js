@@ -1,12 +1,12 @@
 import { encodeBase64 } from './base64.js';
 import { requestViewerJson, ViewerRequestError } from "./request.js";
-import { retainSurfWorkerPool } from '../lib/surf/surfWorkerClient.js';
+import { retainPartWorkerPool } from '../lib/parts/partWorkerClient.js';
 import { retainGlbMeshWorker } from '../lib/render/glbMeshWorkerClient.js';
 import { retainStlMeshWorker } from '../lib/render/stlMeshWorkerClient.js';
 import { applyViewerOriginToEntries, normalizeViewerOrigin, viewerOriginUrl } from './origin.js';
-import { createHttpTessellationCacheProvider, createTessellationCache } from '../lib/surf/tessellationCache.js';
+import { createHttpTessellationCacheProvider, createTessellationCache } from '../lib/parts/tessellationCache.js';
 
-import { resolveSurfaceComponents } from './surfaceResolution.js';
+import { resolveParts } from './partResolution.js';
 import { observeEditingPreview } from './editingPreviewFeed.js';
 import { createHttpCadResourceProvider, scopeCadResources } from './resources.js';
 export * from './origin.js';
@@ -294,23 +294,31 @@ export function createCadClient({ origin = '', fetch: fetchImpl = globalThis.fet
         if (disposed) throw abortError();
       }
     },
-    requestSurfaces(body, { signal } = {}) {
-      return request('/__cad/surfaces', {
-        body, signal, method: 'POST', operation: 'surfaces',
+    robot(file, { signal } = {}) {
+      // A robot description resolved on the SERVER (cadgen.robot_payload): the articulation
+      // the page plays and the visuals it draws, each mesh by a URL this server answers.
+      // Derived data cached by the description's bytes, so a second request is one object
+      // read; a cold read validates, resolves frames and meshes primitives within the 10 s.
+      if (!file) return Promise.reject(new Error('Missing file'));
+      return request('/__cad/robot', { file, signal, timeoutMs: 10_000, operation: 'robot' });
+    },
+    requestParts(body, { signal } = {}) {
+      return request('/__cad/parts', {
+        body, signal, method: 'POST', operation: 'parts',
         headers: { 'content-type': 'application/json', 'x-cadgen-viewer': '1' },
       });
     },
-    cancelSurfaceRequest(body, { signal } = {}) {
-      return request('/__cad/surfaces/cancel', {
-        body, signal, method: 'POST', operation: 'cancel-surfaces',
+    cancelPartRequest(body, { signal } = {}) {
+      return request('/__cad/parts/cancel', {
+        body, signal, method: 'POST', operation: 'cancel-parts',
         headers: { 'content-type': 'application/json', 'x-cadgen-viewer': '1' },
       });
     },
     editingPreview(file, { after = '', signal } = {}) {
       return request('/__cad/preview', { file, signal, params: { after }, operation: 'preview' });
     },
-    resolveSurfaceComponents(descriptor, requested, options) {
-      return resolveSurfaceComponents(descriptor, requested, { ...options, client });
+    resolveParts(descriptor, requested, options) {
+      return resolveParts(descriptor, requested, { ...options, client });
     },
     // A host that already hears a file's build feed (on a call it makes anyway) hands it in as
     // `editingPreviewFeed`, and nothing here asks the route.
@@ -322,10 +330,9 @@ export function createCadClient({ origin = '', fetch: fetchImpl = globalThis.fet
       if (disposed) throw new Error('This CAD client has been disposed.');
       if (file) activeFiles.set(file, (activeFiles.get(file) || 0) + 1);
       const controller = new AbortController();
-      const releases = [retainSurfWorkerPool(), retainGlbMeshWorker(), retainStlMeshWorker()];
+      const releases = [retainPartWorkerPool(), retainGlbMeshWorker(), retainStlMeshWorker()];
       tessellationCache ??= createTessellationCache({
         provider: createHttpTessellationCacheProvider({ origin, headers: { 'x-cadgen-viewer': '1' }, fetch: fetchImpl, maxBatchBytes }),
-        writeBack: { deferMs: 1500, concurrency: 2 }
       });
       const cache = tessellationCache.createSession({ signal: controller.signal });
       let sessionDisposed = false;

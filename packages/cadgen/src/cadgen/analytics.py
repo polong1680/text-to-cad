@@ -251,7 +251,7 @@ CRASHES_PENDING = 16  # past this many different crashes waiting, a process coun
 # given (a model that failed, a file that is not there, an argument it cannot take). Where cadgen reports a
 # failure to the person anyway -- a build's, a command's -- only these are crashes, and only where Python
 # raised them in cadgen's own code: never at a ``raise`` (``_RAISED``), where cadgen says the person's
-# mistake in these words too ("@step returned a dict" is a TypeError). So cadgen code that takes what the
+# mistake in these words too ("@step must return a build123d Shape" is a TypeError). So cadgen code that takes what the
 # person gave it -- a value, a name to forward (``cadgen.build123d``) -- checks it and says so at a raise:
 # Python's error from using it unchecked would read as cadgen's own mistake.
 BUGS = (AttributeError, LookupError, TypeError, NameError, AssertionError, ZeroDivisionError, RecursionError,
@@ -388,7 +388,8 @@ def _update(path: Path, change: Callable[[dict[str, Any]], dict[str, Any]]) -> d
 
 
 # What an environment says (``_environment``): forwarded with every build a client asks the daemon for
-# (``cadgen.daemon.client.FORWARDED_ENV_VARS``), so a client's no holds for its builds there too.
+# (the client's environment travels whole, ``cadgen.daemon.client.forwarded_env``), so a client's no
+# holds for its builds there too.
 ENVIRONMENT = ("DO_NOT_TRACK", "CADGEN_TELEMETRY")
 
 

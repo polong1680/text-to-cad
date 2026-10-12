@@ -40,8 +40,7 @@ Semantics:
   sharing a file each write ``<function>.<fmt>``.
 
 Per-run flags ride ``sys.argv`` of the top-level call: ``--force``,
-``--verbose``, ``--json``, ``--mesh-tolerance``,
-``--mesh-angular-tolerance``. Durable configuration lives
+``--verbose``, ``--json``, ``--profile``. Durable configuration lives
 in the decorator call. A model function takes no parameters: it is one
 configuration of one output. Parametric geometry lives in a plain factory the
 model calls; another configuration is another model.
@@ -75,9 +74,7 @@ __all__ = [
     "threemf",
     "ModelDef",
     "registered_model",
-    "registered_models",
     "building",
-    "build_in_progress",
 ]
 
 
@@ -222,10 +219,6 @@ def _same_file(left: Path, right: Path) -> bool:
         return Path(left) == Path(right)
 
 
-def build_in_progress() -> bool:
-    return bool(getattr(_BUILD_STATE, "frames", None))
-
-
 def current_frame() -> BuildFrame | None:
     frames = getattr(_BUILD_STATE, "frames", None)
     return frames[-1] if frames else None
@@ -257,15 +250,14 @@ class ModelDef:
     fmt: str  # "step" | "dxf"
     script_path: Path
     out: str | None
-    mesh_tolerance: float | None
-    mesh_angular_tolerance: float | None
     # Typed mates (kinematics= dict, validated at decoration); axis refs
     # resolve at build and the block lands in the model's sidecar. STEP only.
     kinematics: KinematicsDef | None = None
-    # Named intrinsic material declarations and the document-scoped animation
-    # module. Both are validated at decoration and resolved during publication.
+    # Named intrinsic material declarations and the animation clips. Both are
+    # validated at decoration and resolved during publication, where the clips
+    # are baked to keyframes against the written document.
     materials: dict[str, Any] | None = None
-    animation: dict[str, str] | None = None
+    animation: dict[str, Any] | None = None
     # Declared mesh serializations (@stl/@glb/@threemf). STEP models only.
     mesh_exports: tuple[MeshExportDecl, ...] = ()
     # False for a MESH-ONLY model (@stl/@glb/@threemf with no @step): the same
@@ -335,10 +327,6 @@ def registered_models_in(script_path: Path) -> list[ModelDef]:
     """Every model registered from ``script_path``, in registration order."""
     resolved = Path(script_path).resolve()
     return [defn for defn in _REGISTRY.values() if defn.script_path == resolved]
-
-
-def registered_models() -> dict[str, ModelDef]:
-    return dict(_REGISTRY)
 
 
 def _script_path_of(func: Callable[..., Any]) -> Path:
@@ -485,8 +473,6 @@ def _decorator(
     fmt: str,
     *,
     out: str | None,
-    mesh_tolerance: float | None,
-    mesh_angular_tolerance: float | None,
     kinematics: object = None,
     materials: object = None,
     animation: object = None,
@@ -496,15 +482,12 @@ def _decorator(
         kinematics_def = (
             normalize_kinematics(kinematics, where=f"@{fmt}") if kinematics is not None else None
         )
-        from cadgen._internal.source_sidecar import normalize_animation, normalize_materials
+        from cadgen._internal.source_sidecar import normalize_materials
+        from cadgen.animation import normalize_clips
 
         materials_def = normalize_materials(materials, where=f"@{fmt} materials=")
-        animation_def = normalize_animation(animation, where=f"@{fmt} animation=")
+        animation_def = normalize_clips(animation, where=f"@{fmt} animation=")
         out = _checked_out(out, where=f"@{fmt}")
-        mesh_tolerance = _checked_tolerance(mesh_tolerance, "mesh_tolerance", where=f"@{fmt}")
-        mesh_angular_tolerance = _checked_tolerance(
-            mesh_angular_tolerance, "mesh_angular_tolerance", where=f"@{fmt}"
-        )
 
     def apply(func: Callable[..., Any]) -> Callable[..., Any]:
         with _declaring(func):
@@ -530,22 +513,11 @@ def _decorator(
             func = prior.func
         _validate_signature(func, fmt=fmt)
         script_path = _script_path_of(func)
-        if animation_def is not None:
-            # The renderer refuses a module exporting anything but `clips`, and
-            # every clip with it: say so here, in its words, not when it opens.
-            from cadgen._internal.animation_source import check_animation_exports
-            from cadgen.render import relative_to_cwd
-
-            check_animation_exports(
-                animation_def["source"], name=f"{relative_to_cwd(script_path)}::{func.__name__} animation"
-            )
         defn = ModelDef(
             func=func,
             fmt=fmt,
             script_path=script_path,
             out=out,
-            mesh_tolerance=mesh_tolerance,
-            mesh_angular_tolerance=mesh_angular_tolerance,
             kinematics=kinematics_def,
             materials=materials_def,
             animation=animation_def,
@@ -619,21 +591,20 @@ def step(
     func: Callable[..., Any] | None = None,
     *,
     out: str | None = None,
-    mesh_tolerance: float | None = None,
-    mesh_angular_tolerance: float | None = None,
     kinematics: object = None,
     materials: object = None,
-    animation: str | None = None,
+    animation: object = None,
     **unsupported: Any,
 ):
     """Declare a STEP model. Usable bare (``@step``) or configured (``@step(...)``).
 
     ``kinematics=`` takes the typed-mates dict (see ``cadgen.kinematics``).
     ``materials=`` declares named definitions and label/group assignments;
-    ``animation=`` embeds a self-contained JavaScript ES module. No
+    ``animation=`` takes a dict of clip id -> ``cadgen.clip(update, duration=...)``,
+    baked to keyframes when the model builds (see ``cadgen.animation``). No
     decorator argument changes the geometry a model writes: the geometry is the
-    function's return value; the arguments decide where the files land, how
-    they are written, and what the sidecar declares. No decorator names
+    function's return value; the arguments decide where the files land and
+    what the sidecar declares. No decorator names
     declaration changes the STEP geometry or its authored colors.
     """
     with _declaring_here():
@@ -641,8 +612,6 @@ def step(
     decorator = _decorator(
         "step",
         out=out,
-        mesh_tolerance=mesh_tolerance,
-        mesh_angular_tolerance=mesh_angular_tolerance,
         kinematics=kinematics,
         materials=materials,
         animation=animation,
@@ -664,9 +633,7 @@ def dxf(
         )
     with _declaring_here():
         _reject_unknown_kwargs("dxf", unsupported)
-    decorator = _decorator(
-        "dxf", out=out, mesh_tolerance=None, mesh_angular_tolerance=None
-    )
+    decorator = _decorator("dxf", out=out)
     return decorator(func) if func is not None else decorator
 
 
@@ -754,10 +721,7 @@ def _mesh_export_decorator(deco_name: str, fmt: str):
             # tree, record and job as any model — whose outputs are its mesh
             # declarations; its .step is never written. A @step stacked above takes
             # the declarations over, so stacking order stays neutral.
-            wrapper = _decorator(
-                "step", out=None, mesh_tolerance=None,
-                mesh_angular_tolerance=None, step_output=False,
-            )(target)
+            wrapper = _decorator("step", out=None, step_output=False)(target)
             registered = _REGISTRY[model_ref(_script_path_of(target), target.__name__)]
             updated = _replace(registered, mesh_exports=(decl,))
             _REGISTRY[updated.ref] = updated

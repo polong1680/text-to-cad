@@ -22,9 +22,6 @@ from typing import Any, Iterable, Mapping, Sequence
 from cadgen.cad_ref_syntax import LABEL_SELECTOR_RE, parse_selector
 
 
-AMBIGUOUS = "__ambiguous__"
-
-
 class LabelResolutionError(ValueError):
     """A label selector that cannot be turned into exactly one occurrence id."""
 
@@ -71,10 +68,7 @@ def build_label_aliases(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     ordered: list[tuple[str, str]] = []
     for row in rows:
         # `occurrenceId` is the spelling the tree uses for the same
-        # field (@text-to-cad/core/common/cadScene.js reads `part.id || part.occurrenceId`
-        # throughout), and buildLabelAliasMap accepts both. Reading only `id`
-        # here dropped those rows, so a label the viewer resolves had no alias
-        # in the CLI.
+        # field, so a row may carry either.
         occurrence_id = str(row.get("id") or row.get("occurrenceId") or "").strip()
         if not occurrence_id:
             continue
@@ -146,16 +140,37 @@ def attach_label_aliases(index: Any) -> Any:
     return replace(index, label_aliases=built)
 
 
-def label_ref_for_occurrence(alias_map: Mapping[str, Any], occurrence_id: str) -> str:
-    """The `#alias` a user should paste for this occurrence, or "" when it has none."""
-    aliases = alias_map.get("aliases") if isinstance(alias_map, Mapping) else None
-    if not isinstance(aliases, Mapping):
-        return ""
-    target = str(occurrence_id or "").strip()
-    for alias, mapped in aliases.items():
-        if mapped == target:
-            return f"#{alias}"
-    return ""
+class TreeNames:
+    """The ``#name`` namespace of an instance tree, groups and parts alike, under the
+    rule ``read_scene`` keeps: a name means the one node it names, and a name several
+    nodes share is refused, listing the numbered aliases (``#arm_1``, ``#arm_2``) that
+    each name one. Clips, material assignments and mates resolve here, so a name means
+    the same node, and a shared one fails the same way, wherever it is written."""
+
+    def __init__(self, by_name: Mapping[str, Sequence[str]]):
+        self._by_name = {name: tuple(node_ids) for name, node_ids in by_name.items()}
+        self._aliases = build_label_aliases(
+            {"id": node_id, "name": name} for name, node_ids in self._by_name.items() for node_id in node_ids
+        )
+
+    def resolve(self, name: str) -> str | None:
+        """The node ``name`` (or a numbered alias) names, None when none does. A name
+        several nodes share raises :class:`LabelResolutionError`."""
+        node_ids = self._by_name.get(name, ())
+        if len(node_ids) == 1:
+            return node_ids[0]
+        if not node_ids:
+            return self._aliases["aliases"].get(name)
+        if name in self._aliases["ambiguous"]:
+            _resolve_label(self._aliases, name)  # raises, listing the numbered aliases
+        # A name outside the label grammar takes no aliases: its nodes go by id.
+        shown = ", ".join(f"#{node_id}" for node_id in node_ids)
+        raise LabelResolutionError(f"label '{name}' matches {len(node_ids)} occurrences; use one of: {shown}")
+
+    def names(self) -> list[str]:
+        """Every name that resolves: each name one node has, and each numbered alias."""
+        unique = {name for name, node_ids in self._by_name.items() if len(node_ids) == 1}
+        return sorted(unique | set(self._aliases["aliases"]))
 
 
 def _resolve_label(alias_map: Mapping[str, Any], label: str) -> str:
@@ -215,12 +230,3 @@ def resolve_label_selectors(
 
 
 _KIND_FOR_TYPE = {"shape": "s", "face": "f", "edge": "e", "vertex": "v"}
-
-
-def selectors_contain_label(selectors: Iterable[str]) -> bool:
-    """True when any selector needs an alias map to resolve."""
-    for raw in selectors or []:
-        parsed = parse_selector(str(raw or "").strip())
-        if parsed is not None and parsed.label:
-            return True
-    return False

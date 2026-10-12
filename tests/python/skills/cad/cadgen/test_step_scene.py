@@ -19,7 +19,6 @@ from cadgen._internal.step_scene import (
     load_step_scene,
     scene_occurrence_shape,
 )
-from cadgen._internal.glb_topology import STEP_TOPOLOGY_SCHEMA_VERSION
 from tests.python.support.tmp_root import temporary_directory
 
 
@@ -61,7 +60,7 @@ class StepSceneSelectorArtifactTests(unittest.TestCase):
 
     def test_package_roundtrip_restores_locations_and_face_colors(self) -> None:
         # scene -> compound -> package -> scene: placements and per-face colors
-        # survive (colors ride the component .surf, keyed by face ordinal).
+        # survive (colors ride the component's intrinsic recipe, keyed by face ordinal).
         with temporary_directory(prefix="cad-step-scene-package-rt-") as temp_dir:
             temp_root = Path(temp_dir)
             shape = build123d.Box(1, 1, 1).wrapped

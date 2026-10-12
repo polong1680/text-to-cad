@@ -335,33 +335,36 @@ class SavedStepReadbackTest(unittest.TestCase):
                         self.assertEqual(object_path(object_digest).read_bytes(), payload)
                         self.assertEqual(object_hash(payload), object_digest)
 
-    def test_missing_or_unreadable_surface_never_blocks_native_face_colors(self):
+    def test_missing_or_unreadable_display_data_never_blocks_native_face_colors(self):
         from cadgen._internal.step_scene_package import scene_from_render_package
-        from cadgen.store import surfaces
+        from cadgen.store import parts
         from cadgen.store.index import write_entry
         from cadgen.store.objects import object_path, put_object
         from cadgen.store.trees import get_tree
 
         expected = self.seed()
         tree = expected[2]["documentTree"]
-        expected_colors = sorted(tuple(color) for entry in get_tree(tree)["components"].values()
+        components = get_tree(tree)["components"]
+        expected_colors = sorted(tuple(color) for entry in components.values()
                                  for color in entry["faceColors"].values())
-        record = next(iter(surfaces.derive(tree).values()))
-        payload = object_path(record["object"]).read_bytes()
+        cid, record = next(iter(parts.derive(tree).items()))
+        key = parts.part_key(components[cid], parts.producer_identity())
+        payloads = {role: object_path(record[role]["object"]).read_bytes() for role in ("glb", "selectors")}
         for damage in ("missing", "digest-mismatched", "hash-valid-unreadable"):
             with self.subTest(damage=damage):
-                put_object(payload, repair=True)
-                write_entry("surface", record["surfaceInput"], record)
+                for payload in payloads.values():
+                    put_object(payload, repair=True)
+                write_entry("part", key, record)
                 if damage == "missing":
-                    object_path(record["object"]).unlink()
+                    object_path(record["glb"]["object"]).unlink()
                 elif damage == "digest-mismatched":
-                    object_path(record["object"]).write_bytes(b"corrupt surface")
+                    object_path(record["selectors"]["object"]).write_bytes(b"corrupt selector table")
                 else:
-                    write_entry("surface", record["surfaceInput"], {
-                        **record, "object": put_object(b"hash-valid unreadable SURF"),
+                    write_entry("part", key, {
+                        **record, "glb": {**record["glb"], "object": put_object(b"hash-valid unreadable mesh")},
                     })
                 with mock.patch("cadgen._internal.step_scene_loader.load_step_scene", side_effect=AssertionError("native hit parsed STEP")), \
-                        mock.patch("cadgen._internal.surface_extract.extract_surface_component", side_effect=AssertionError("native read extracted SURF")):
+                        mock.patch("cadgen._internal.topology_extract.extract_topology_facts", side_effect=AssertionError("native read extracted topology facts")):
                     scene = scene_from_render_package(self.root / "part.step", step_hash=expected[3])
                     self.assertIsNotNone(scene)
                     actual_colors = sorted(color for recipe in scene.prototype_face_colors.values()
@@ -373,13 +376,14 @@ class SavedStepReadbackTest(unittest.TestCase):
         from cadgen._internal.step_scene_loader import load_step_scene
         from cadgen.store.index import remove_entry
         from cadgen.store.objects import object_path
+        from cadgen.store.records import document_key
         from cadgen.store.trees import get_tree
 
         expected = self.seed()
         component = next(iter(get_tree(expected[2]["documentTree"])["components"].values()))
         for force in (False, True):
             with self.subTest(force=force):
-                remove_entry("document", expected[3])
+                remove_entry("document", document_key(expected[3]))
                 path = object_path(component["brep"])
                 original = path.read_bytes()
                 path.write_bytes(b"corrupt component, no document index")
@@ -434,15 +438,17 @@ class SavedStepReadbackTest(unittest.TestCase):
     def test_honestly_hashed_invalid_native_recipe_and_eager_inputs_cannot_reuse_identity(self):
         from cadgen._internal import component_package as cp, step_scene_package
         from cadgen._internal.step_scene_loader import load_step_scene
-        from cadgen.store import surfaces
+        from cadgen.store import parts
         from cadgen.store.build import _publish_document_scene
         from cadgen.store.objects import put_object, read_verified_object
         from cadgen.store.records import note_document_tree
-        from cadgen.store.trees import get_tree
+        from cadgen.store.trees import capture_tree, get_tree
 
         expected = self.seed()
         tree_hash = expected[2]["documentTree"]
-        surface = next(iter(surfaces.derive(tree_hash).values()))["object"]
+        native = next(iter(capture_tree(tree_hash, retain_payloads=False)[0]["components"].values()))
+        from cadgen._internal.topology_facts import topology_facts_bytes
+        surface = put_object(topology_facts_bytes(parts._topology(native, parts._decoded(native)[0])))
         for mode in ("unreadable-native", "absent-face", "eager-only", "singular-placement"):
             with self.subTest(mode=mode):
                 tree = get_tree(tree_hash)
@@ -454,12 +460,12 @@ class SavedStepReadbackTest(unittest.TestCase):
                 elif mode == "absent-face":
                     entry["faceColors"]["999"] = [1., 0., 0., 1.]
                 elif mode == "eager-only":
-                    entry.update(kind="eager-only", eagerSurface=surface)
+                    entry.update(kind="eager-only", topology=surface)
                 else:
                     tree["occurrences"][0]["transform"][:12] = [0.] * 12
                 entry["contentHash"] = cp.geometry_component_hash(
                     entry["codec"], payload, entry["faceColors"], kind=entry["kind"],
-                    eager_surface=entry.get("eagerSurface"),
+                    topology=entry.get("topology"),
                 )
                 new_cid = entry["contentHash"][:16]
                 tree["components"] = {new_cid: entry}

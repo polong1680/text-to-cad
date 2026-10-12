@@ -221,10 +221,6 @@ def _materialized_metadata(node: Any, *, root: bool) -> tuple:
     if color is not None and type(color) is not Color:
         raise ValueError("materialized color is not a build123d Color")
     rgba = None if color is None else tuple(float(v) for v in color)
-    if "cad_material" in node.__dict__:
-        raise ValueError(
-            "cad_material authoring was removed; declare named materials with @step(materials=...)"
-        )
     authored_material = node.__dict__.get("_cadgen_material")
     if authored_material is None:
         authored_material = {}
@@ -551,12 +547,6 @@ def _material_from_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
     return resolved or None
 
 
-def tree_tag(shape: Any) -> str | None:
-    """The tree hash a materialized compound carries, or None."""
-    tag = getattr(shape, TREE_TAG, None)
-    return str(tag) if tag else None
-
-
 def materialize(tree_hash: str, *, label: str | None = None) -> Any:
     """A ``Compound`` for the tree. Raises FileNotFoundError when the tree or a
     component object is missing (the gate should have said stale)."""
@@ -604,8 +594,8 @@ def materialize_descriptor(
         if entry.get("kind") != "native":
             raise ValueError("unsupported geometry component kind")
         if cid in shapes:
-            # Unpublished own shapes have no SURF object yet. Their extraction
-            # input is authoritative, and normalization takes a private copy.
+            # Unpublished own shapes have no published component yet. Their
+            # face colours are authoritative, and normalization takes a private copy.
             face_colors_by_cid[cid] = _normalized_face_colors(
                 getattr(shapes[cid], "cad_face_ordinal_colors", None)
             )

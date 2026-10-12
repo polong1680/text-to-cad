@@ -13,9 +13,9 @@ subtree that is a child model's materialized geometry, found intact, becomes a
   → the model's own components. No error path.
 
 Each native component is privately decoded and validated before publication.
-Surface extraction is a separate artifact derivation and never delays native
+A part's display data is a separate artifact derivation and never delays native
 geometry readiness. A component without an admitted native codec explicitly
-pins its eager surface; no later producer receives the original live shape.
+pins its topology facts; no later producer receives the original live shape.
 
 A model's final result contains its authored source geometry, reconstructed
 from canonical BREP bytes, whether it declares STEP or only meshes. A STEP
@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from cadgen.cad_ref_syntax import OCCURRENCE_SELECTOR_RE
 from cadgen.coordination import PHASE_COMPONENTS, PHASE_FINALIZE, PHASE_PACKAGE
 from cadgen.coordination import resolve as resolve_progress
 from cadgen.store.index import write_entry
@@ -249,8 +250,13 @@ def _document_walk(
         return {"id": occurrence_id, "name": name, "nodeType": "part",
                 "leafPartIds": [occurrence_id], "children": []}
 
-    progress.phase(PHASE_PACKAGE)
     roots = list(scene.roots)
+
+    def leaves(node: Any) -> int:
+        return sum(leaves(child) for child in node.children) if node.children else 1
+
+    # Counted, as collect() advances once per leaf: a large assembly's wait has a fraction.
+    progress.phase(PHASE_PACKAGE, total=sum(leaves(root) for root in roots))
     if not roots:
         raise RuntimeError("STEP has no product roots")
     if len(roots) == 1:
@@ -270,13 +276,13 @@ def _publish_document_scene(
     scene: Any, *, force: bool, progress: Any, repair_objects: bool = False,
 ) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, list[str]], dict[str, str]]:
     from cadgen._internal.glb_topology import (
-        STEP_EDGE_DEFAULT_RENDER_VISIBILITY_CLASSES, step_topology_capabilities,
+        STEP_EDGE_DEFAULT_RENDER_VISIBILITY_CLASSES, step_edge_capabilities,
     )
 
     walk, artifact, occurrence_map, node_map = _document_walk(scene, progress=progress, force=force)
     digest, tree, stats = _publish_tree(
         walk, bbox_shape=artifact, root_name=walk.root["name"], force=force, progress=progress,
-        extra={"capabilities": step_topology_capabilities(),
+        extra={"capabilities": step_edge_capabilities(),
                "edgeRendering": {"visibilityClasses": list(STEP_EDGE_DEFAULT_RENDER_VISIBILITY_CLASSES)}},
         repair_objects=repair_objects,
         prepared_occurrence_bounds=True,
@@ -300,6 +306,15 @@ def build_document_tree(
         scene, force=force, progress=resolve_progress(progress), repair_objects=True,
     )
     return digest, tree, stats
+
+
+def _own_name(label: object, default: str) -> str:
+    """A node's name in the tree being walked: its label, unless that is an
+    occurrence id. A document names an unlabelled group by its id, so a group
+    read back from one (``read_step``, a materialized tree) carries an id from
+    that document, which names nothing at its place here."""
+    text = str(label or "")
+    return default if not text or OCCURRENCE_SELECTOR_RE.match(text) else text
 
 
 def _walk_compound(compound: Any, *, root_name: str, progress: Any) -> _Walk:
@@ -383,8 +398,7 @@ def _walk_compound(compound: Any, *, root_name: str, progress: Any) -> _Walk:
             except Exception:  # noqa: BLE001
                 pass
         components.setdefault(cid, entry_meta)
-        if name is None:
-            name = str(getattr(node, "label", "") or f"part_{occ_id}")
+        name = _own_name(getattr(node, "label", "") if name is None else name, f"part_{occ_id}")
         occurrence: dict[str, Any] = {
             "id": occ_id,
             "name": name,
@@ -405,7 +419,7 @@ def _walk_compound(compound: Any, *, root_name: str, progress: Any) -> _Walk:
         return {"id": occ_id, "name": name, "nodeType": "part", "leafPartIds": [occ_id], "children": []}
 
     def _add_link(node: Any, world_loc: Any, occ_id: str, tree_hash: str) -> dict[str, Any]:
-        name = str(getattr(node, "label", "") or occ_id)
+        name = _own_name(getattr(node, "label", ""), occ_id)
         # The link places the child's TREE FRAME. The node's location is
         # ``placement * root`` when the child's own root occurrence is placed
         # (a part returned as ``Pos(...) * body``), and the tree re-applies that
@@ -435,7 +449,7 @@ def _walk_compound(compound: Any, *, root_name: str, progress: Any) -> _Walk:
         ]
         return {
             "id": path,
-            "name": node["name"],
+            "name": _own_name(node["name"], path),
             "nodeType": "subassembly",
             "leafPartIds": [leaf for cn in child_nodes for leaf in cn.get("leafPartIds", [cn["id"]])],
             "children": child_nodes,
@@ -460,7 +474,7 @@ def _walk_compound(compound: Any, *, root_name: str, progress: Any) -> _Walk:
         nested_tree = getattr(node, "_occurrence_tree", None)
         if nested_tree is not None:
             spliced = _consume_spliced(dict(nested_tree, leaf=False), world_loc, path)
-            spliced["name"] = str(getattr(node, "label", "") or nested_tree.get("name") or path)
+            spliced["name"] = _own_name(getattr(node, "label", ""), "") or _own_name(nested_tree.get("name"), path)
             return spliced
         child_shapes = materialized_children(node, baseline)
         if not child_shapes:
@@ -478,7 +492,7 @@ def _walk_compound(compound: Any, *, root_name: str, progress: Any) -> _Walk:
         ]
         return {
             "id": path,
-            "name": str(getattr(node, "label", "") or path),
+            "name": _own_name(getattr(node, "label", ""), path),
             "nodeType": "subassembly",
             "leafPartIds": [leaf for cn in child_nodes for leaf in cn.get("leafPartIds", [cn["id"]])],
             "children": child_nodes,
@@ -541,7 +555,7 @@ def _publish_tree(
     prepare_bbox_shape: Callable[[], Any] | None = None,
     link_bounds: Callable[[], dict[str, list[float]] | None] | None = None,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    """Publish verified geometry inputs before any disposable surface work.
+    """Publish verified geometry inputs before any disposable display work.
 
     ``link_bounds`` answers an all-link result's bounds from its links
     (:func:`_bbox_from_links`); ``prepare_bbox_shape`` stands in for
@@ -557,7 +571,7 @@ def _publish_tree(
         payload = prepared["payload"] if prepared is not None else read_verified_object(entry["brep"])
         validate_geometry_component(entry, payload, cid=cid)
         ready = not force
-        for object_key in ("brep", "eagerSurface"):
+        for object_key in ("brep", "topology"):
             if not entry.get(object_key):
                 continue
             try:
@@ -567,18 +581,18 @@ def _publish_tree(
         # Reused bytes are claimed for this publish, so a sweep that started
         # before it cannot take them (STORE.md §8); ones a sweep already took
         # are written again from the bytes in hand.
-        if ready and all(claim_object(entry[key]) for key in ("brep", "eagerSurface") if entry.get(key)):
+        if ready and all(claim_object(entry[key]) for key in ("brep", "topology") if entry.get(key)):
             reused.append(cid)
         else:
             # Capture owns these exact bytes; repair does not ask the live
             # authored shape or a newer child result to replace this input.
             put_object(payload, repair=True)
-            if entry.get("eagerSurface"):
-                surface = prepared["surface"] if prepared is not None else read_verified_object(entry["eagerSurface"])
-                put_object(surface, repair=True)
+            if entry.get("topology"):
+                topology = prepared["topology"] if prepared is not None else read_verified_object(entry["topology"])
+                put_object(topology, repair=True)
             built.append(cid)
         write_entry("component", cid, {"schemaVersion": 1, **entry})
-        progress.advance(detail=cid)
+        progress.advance()
 
     progress.phase(PHASE_FINALIZE)
     # Resolved intrinsic appearance has one home in schema-2 trees. Transient
@@ -1357,15 +1371,15 @@ def writer_input_digest(descriptor: dict[str, Any], *, root_name: str, step_name
     That is the flattened descriptor the writer is given — geometry by BREP
     object hash with its intrinsic face colours, placements, names, colours
     and grouping — plus the file it writes, :data:`STEP_WRITER_SCHEME`, the
-    cadgen release and the loaded kernel. Two fields a document never carries
-    are left out: the root's authored name (the root product and the header
-    are named after the file) and finishes (they ride the sidecar, law 16).
-    Everything else counts, so an input the writer may read can only cost a
-    write, never keep stale bytes. None when the kernel cannot be named or the
-    descriptor holds a value that is not canonical JSON.
+    cadgen release and the loaded kernel. The root counts under the name the
+    document gives it, ``root_name``, which its root product and header carry;
+    finishes are left out, since they ride the sidecar (law 16). Everything
+    else counts, so an input the writer may read can only cost a write, never
+    keep stale bytes. None when the kernel cannot be named or the descriptor
+    holds a value that is not canonical JSON.
     """
     from cadgen._internal.component_package import canonical_json_bytes
-    from cadgen.store.surfaces import kernel_versions
+    from cadgen.store.parts import kernel_versions
 
     try:
         kernel = kernel_versions()

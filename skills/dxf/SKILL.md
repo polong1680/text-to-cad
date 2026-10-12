@@ -27,8 +27,8 @@ kernel load errors.
 
 Drawings are build123d geometry, so a drawing build loads the CAD kernel like a
 STEP build does (~2.5s cold; the warm daemon absorbs it on re-runs).
-`cadgen dxf snapshot` needs no Node at all: it flattens the drawing with `ezdxf`
-(which arrives with cadgen) and paints it in the bundled headless browser.
+`cadgen dxf snapshot` flattens the drawing with `ezdxf` (which arrives with
+cadgen) and paints it in the bundled headless browser.
 
 ## Purpose
 
@@ -253,8 +253,8 @@ cadgen dxf snapshot path/to/imported.dxf review.png
 cadgen dxf snapshot path/to/drawing.dxf review.png --appearance dark
 ```
 
-It takes the `.dxf` document only — a model script is refused by name (run
-`python <drawing>.py`, then snapshot the drawing it wrote). The whole drawing is
+It takes the `.dxf` document only: run `python <drawing>.py` first, then
+snapshot the drawing it wrote. The whole drawing is
 fitted to the image and painted head on, in the pens the file declares; an
 entity with no pen of its own (ACI 7) takes the appearance's foreground on its
 background. The command flattens the drawing with `ezdxf` and renders it through
@@ -306,8 +306,7 @@ validation don't replace this.
 
 - If your tools include `cad_show` (your host may prefix it), use it with the file's
   absolute path, and follow its description for when to call it again. `cad_view` reads
-  what the user selected; `cad_screenshot` shows you what they see. Neither is a review
-  of your own work.
+  what the user selected; `cad_screenshot` shows you what they see.
 - Otherwise run the CAD Viewer, from any folder:
 
   ```bash
