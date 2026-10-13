@@ -113,7 +113,7 @@
     "typescript-eslint": "8.69.0",
     "unified": "11.0.5",
     "use-stick-to-bottom": "1.1.6",
-    "vite": "7.3.6",
+    "vite": "8.3.4",
     "vitest": "5.0.0",
     "zustand": "5.0.15",
     "@text-to-cad/ui": "*",
