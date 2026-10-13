@@ -297,7 +297,7 @@ jobs:
       # next, from the runner's own Python, so the bundle pins the closure the
       # release was tested against.
       - name: Download the cadgen wheel
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: cadgen-${{ needs.publish.outputs.version }}
           path: apps/desktop/resources/cadgen
@@ -488,7 +488,7 @@ jobs:
       # single release operation below.
       - name: Download the desktop installers
         if: steps.desktop-assets.outputs.count != '0'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: text-to-cad-*
           merge-multiple: true
