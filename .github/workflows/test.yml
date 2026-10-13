@@ -367,7 +367,7 @@ jobs:
       # cached install resolved until one of those files changes.
       - name: Restore the checkout venv
         id: venv
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .venv
           key: desktop-venv-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-${{ hashFiles('requirements-dev.txt', 'packages/cadgen/pyproject.toml') }}
@@ -393,7 +393,7 @@ jobs:
       # content-keyed cache re-lints changed files -- no rule here is type-aware, so a
       # file's lint result depends on that file and the config alone.
       - name: Restore typecheck and lint state
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             apps/desktop/node_modules/.tmp
@@ -425,7 +425,7 @@ jobs:
 
       - name: Restore the build
         id: build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             apps/desktop/out
